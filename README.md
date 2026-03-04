@@ -1,4 +1,4 @@
-# My Python repo
+# Climate emulator evaluation and validation pipeline
 <!--- Adding a one-line description of what this repository is for here may be
 helpful -->
 <!---
