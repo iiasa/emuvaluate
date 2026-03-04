@@ -1,0 +1,44 @@
+[project]
+authors = [
+    { name = "Annika Högner, Verena Kain, Tessa Möller, Zebedee Nicholls, Niklas Schwind, Marco Zecchetto", email = "hoegner@iiasa.ac.at, kain@iiasa.ac.at, moeller@iiasa.ac.at, nicholls@iiasa.ac.at, schwind@iiasa.ac.at, zecchetto@iiasa.ac.at"},
+]
+requires-python = ">=3.9"
+dependencies = [
+    "pre-commit>=3.3.1",
+    "jupyterlab>=4.0.0",
+    "jupytext>=1.15.2",
+]
+name = "prototype"
+version = "0.1.0"
+description = "Evaluation and calibration pipeline for climate emulators"
+readme = "README.md"
+
+[tool.uv]
+package = false
+
+[tool.jupytext]
+formats = "ipynb,py:percent"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "D",
+    "PL",
+    "TRY",
+    "NPY",
+    "RUF",
+    "UP",
+    "S",
+]
+unfixable = [ ]
+ignore = [
+    "D200",
+    "D400",
+    "UP007",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"

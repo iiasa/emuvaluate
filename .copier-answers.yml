@@ -1,0 +1,10 @@
+# Changes here will be overwritten by Copier
+_commit: v0.4.2
+_src_path: gl:openscm/copier-basic-python-repository
+email: hoegner@iiasa.ac.at, kain@iiasa.ac.at, moeller@iiasa.ac.at, schwind@iiasa.ac.at,
+    zecchetto@iiasa.ac.at
+name: Annika Högner, Verena Kain, Tessa Möller, Niklas Schwind, Marco Zecchetto
+notebooks: true
+package_manager: uv
+project_description_short: Evaluation and calibration pipeline for climate emulators
+project_url: https://github.com/iiasa/emuvaluate
