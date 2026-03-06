@@ -1,25 +1,12 @@
-# Climate emulator evaluation and validation pipeline
-<!--- Adding a one-line description of what this repository is for here may be
-helpful -->
-<!---
+# emuvaluate — Climate emulator evaluation and validation pipeline
 
-We recommend having a status line in your repo to tell anyone who stumbles
-on your repository where you're up to. Some suggested options:
-
-- prototype: the project is just starting up and the code is all prototype
-- development: the project is actively being worked on
-- finished: the project has achieved what it wanted and is no longer being
-  worked on, we won't reply to any issues
-- dormant: the project is no longer worked on but we might come back to it, if
-  you have questions, feel free to raise an issue
-- abandoned: this project is no longer worked on and we won't reply to any
-  issues
-
--->
+Evaluation toolkit for climate emulator ensembles. Provides preprocessing, scoring metrics, and diagnostic plots to compare emulated regional temperature outputs against CMIP6 simulations.
 
 ## Status
 
 - prototype: the project is just starting up and the code is all prototype
+
+---
 
 ## Installation
 
@@ -57,15 +44,165 @@ As another example, to run a notebook server, run
 uv run jupyter lab
 ```
 
-<!--- Other documentation and instructions can then be added here as you go,
-perhaps replacing the other instructions above as they may become redundant.
--->
+Alternatively, to install directly with pip in editable mode:
+
+```bash
+git clone git@github.com:iiasa/emuvaluate.git
+cd emuvaluate
+pip install -e .
+```
+
+---
+
+## Package structure
+
+```
+emuvaluate/
+├── pyproject.toml
+├── notebooks/
+└── src/
+    └── emuvaluate/
+        ├── metrics.py          # scoring functions
+        ├── transforms.py       # preprocessing functions
+        ├── plots.py            # diagnostic plots
+        └── data_preparation.py # data loading pipeline
+```
+
+---
+
+## Usage
+
+### Data loading
+
+```python
+from emuvaluate.data_preparation import load_scenarios
+
+scenario_data = load_scenarios(
+    model='ACCESS-ESM1-5',
+    indicators=['tas'],
+    scenarios=['ssp245'],
+    model_path='/path/to/model/data',
+    monthly_flag=True,
+    use_smoothing=False,
+    train_pattern_scaling_name='ssp245',
+)
+```
+
+### Full diagnostic plot
+
+```python
+from emuvaluate.plots import plot_metric_extremes
+
+scores = plot_metric_extremes(
+    y_pred_ensemble=y_pred,   # (n_members, T, n_regions)
+    scenario_data=scenario,   # (n_members, T, n_regions)
+    metric='crps',
+    n_examples=5,
+    detrend=True,
+    detrend_tau=5,
+    deseasonalise=True,
+)
+```
+
+### Using components individually
+
+```python
+from emuvaluate.transforms import preprocess, detrend_gaussian, deseasonalise
+from emuvaluate.metrics import compute_metric_all_regions, crps_score
+from emuvaluate.plots import rank_regions
+
+# Preprocess
+data_clean = deseasonalise(detrend_gaussian(data, tau=20))
+
+# Score all regions
+scores = compute_metric_all_regions(obs, pred, metric='crps')
+
+# Rank
+best, worst = rank_regions(scores, n_examples=5)
+```
+
+---
+
+## API reference
+
+### `emuvaluate.metrics`
+
+| Function | Description |
+|---|---|
+| `crps_score(obs, pred)` | Mean Continuous Ranked Probability Score over all timesteps. Lower is better. |
+| `mean_score(obs, pred)` | Absolute difference between ensemble grand means. |
+| `sigma_score(obs, pred)` | Absolute difference between ensemble standard deviations. |
+| `psd_score(obs, pred)` | Wasserstein distance between mean power spectral densities (Welch method). |
+| `compute_metric_all_regions(obs, pred, metric)` | Applies a named metric to every region. Returns `dict[region_idx → score]`. |
+
+All score functions accept arrays of shape `(n_members, T)` and return a single float.
+Available metric names: `'crps'`, `'mean'`, `'sigma'`, `'psd'`.
+
+---
+
+### `emuvaluate.transforms`
+
+All functions accept arrays of shape `(n_members, T, n_regions)` and return a transformed copy.
+
+| Function | Description |
+|---|---|
+| `yearly_average(data)` | Collapses 12 consecutive monthly timesteps into annual means. |
+| `select_month(data, month)` | Retains only timesteps for a given calendar month (1–12). |
+| `deseasonalise(data, period=12)` | Subtracts the mean seasonal cycle per member and region. |
+| `detrend_gaussian(data, tau=20)` | Removes a Gaussian-smoothed trend (sigma=`tau` timesteps) per member and region. |
+| `preprocess(data, ...)` | Convenience wrapper applying all steps in order: aggregation → deseasonalise → detrend. |
+
+`preprocess` keyword arguments:
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `apply_yearly_average` | bool | False | Collapse to annual means |
+| `month_selection` | int or None | None | Keep one calendar month only |
+| `apply_deseasonalise` | bool | False | Remove seasonal cycle |
+| `apply_detrend` | bool | False | Remove Gaussian trend |
+| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
+
+`apply_yearly_average` and `month_selection` are mutually exclusive.
+
+---
+
+### `emuvaluate.plots`
+
+| Function | Description |
+|---|---|
+| `plot_metric_extremes(y_pred_ensemble, scenario_data, ...)` | Preprocesses data, scores all regions, and plots the best and worst examples side by side. Returns `dict[region_idx → score]`. |
+| `rank_regions(metric_scores, n_examples=5)` | Splits a scores dict into the `n_examples` best and worst region pairs. Useful if you already have scores from a previous run. |
+
+`plot_metric_extremes` arguments:
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `y_pred_ensemble` | ndarray | — | Emulated ensemble `(n_members, T, n_regions)` |
+| `scenario_data` | ndarray | — | Ground-truth ensemble `(n_members, T, n_regions)` |
+| `n_examples` | int | 5 | Number of best/worst regions to show |
+| `metric` | str | `'crps'` | One of `'crps'`, `'mean'`, `'sigma'`, `'psd'` |
+| `yearly_average` | bool | False | Aggregate to annual before scoring |
+| `month_selection` | int or None | None | Restrict to one calendar month |
+| `detrend` | bool | False | Remove Gaussian trend before scoring |
+| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
+| `deseasonalise` | bool | False | Remove seasonal cycle before scoring |
+| `save_path` | str or None | None | Save figure to this path at 300 dpi |
+
+---
+
+### `emuvaluate.data_preparation`
+
+| Function | Description |
+|---|---|
+| `load_scenarios(model, indicators, scenarios, model_path, ...)` | Full pipeline: finds files, loads CSVs, computes anomalies relative to baseline, optionally applies pattern scaling. Returns a list of arrays, one per scenario. |
+| `prepare_scenario_data(...)` | Single-indicator version of `load_scenarios`. |
+| `process_scenarios(...)` | Loads and aligns one baseline/scenario CSV pair and returns `(gmt_df, regional_df)`. |
+| `fit_regional_regressions(global_series, regional_series, ...)` | Fits per-region linear regressions against GMT, with optional ramp-down correction. |
+| `predict_regional_temperatures(global_test_series, slopes, intercepts, ...)` | Applies fitted regression parameters to a new GMT series to predict regional temperatures. |
+
+---
 
 ## Development
-
-<!--- In bigger projects, we would recommend having separate docs where this
-development information can go. However, for such a simple repository, having
-it all in the README is fine. -->
 
 Install and run instructions are the same as the above (this is a simple
 repository, without tests etc. so there are no development-only dependencies).
@@ -77,7 +214,6 @@ contributing, partly because we don't know what we're trying to achieve (we're
 just exploring). If you would like to contribute, it is best to raise an issue
 to discuss what you want to do (without a discussion, we can't guarantee that
 any contribution can actually be used).
-<!--- You may want to update this section as the project evolves. -->
 
 ### Repository structure
 
@@ -115,12 +251,20 @@ In this repository, we use the following tools:
     - basic file checks (removing unneeded whitespace, not committing large
       files etc.)
     - (for more thoughts on the usefulness of pre-commit, see
-      [general principles: automation](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/general-principles/automation.md)
+      [general principles: automation](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/general-principles/automation.md))
     - track your notebooks using
-    [jupytext](https://jupytext.readthedocs.io/en/latest/index.html)
-    (for more thoughts on the usefulness of Jupytext, see
-    [tips and tricks: Jupytext](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/tips-and-tricks/managing-notebooks-jupytext.md))
+      [jupytext](https://jupytext.readthedocs.io/en/latest/index.html)
+      (for more thoughts on the usefulness of Jupytext, see
+      [tips and tricks: Jupytext](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/tips-and-tricks/managing-notebooks-jupytext.md))
         - this avoids nasty merge conflicts and incomprehensible diffs
+
+---
+
+## Authors
+
+Annika Högner, Verena Kain, Tessa Möller, Zebedee Nicholls, Niklas Schwind, Marco Zecchetto — IIASA
+
+---
 
 ## Original template
 
