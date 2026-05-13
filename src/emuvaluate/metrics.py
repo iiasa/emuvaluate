@@ -330,7 +330,7 @@ QQ_METRIC_LABELS: dict[str, str] = {
     "mse":      "MSE (Quantiles)",
     "nmse":     "Normalised MSE (Quantiles)",
     "ks":       "KS Statistic",
-    "tail_mae": "Tail MAE (Quantiles)",
+    "tail_mae": "Tail MAE",
 }
 
 
@@ -410,3 +410,136 @@ ERROR_METRIC_REGISTRY: dict[str, tuple[str, callable]] = {
     "nmae":   ("Normalised MAE", nmae_score),
     "nmse":   ("Normalised MSE", nmse_score),
 }
+
+
+
+from scipy.signal import welch
+from sklearn.decomposition import PCA
+
+
+def compute_psd_scores(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    fs: float = 1.0,  # 1 sample per month
+    nperseg: int = 256,
+) -> dict:
+    """
+    Compute power spectral density for each region and member using Welch's method,
+    after removing the ensemble mean to isolate internal variability.
+
+    Parameters
+    ----------
+    obs_data  : (n_members, T, n_regions)
+    pred_data : (n_members, T, n_regions)
+    fs        : sampling frequency (1/month by default)
+    nperseg   : Welch segment length — larger = finer frequency resolution
+
+    Returns
+    -------
+    dict with keys:
+        'freqs'    : (n_freqs,) — frequency axis in cycles/month
+        'obs_psd'  : (n_members, n_freqs, n_regions)
+        'pred_psd' : (n_members, n_freqs, n_regions)
+    """
+    n_members, T, n_regions = obs_data.shape
+
+    # remove ensemble mean to isolate internal variability
+    obs_anom  = obs_data  - obs_data.mean(axis=0, keepdims=True)
+    pred_anom = pred_data - pred_data.mean(axis=0, keepdims=True)
+
+    freqs, _ = welch(obs_anom[0, :, 0], fs=fs, nperseg=nperseg)
+    n_freqs  = len(freqs)
+
+    obs_psd  = np.zeros((n_members, n_freqs, n_regions))
+    pred_psd = np.zeros((n_members, n_freqs, n_regions))
+
+    for m in range(n_members):
+        for r in range(n_regions):
+            _, obs_psd[m, :, r]  = welch(obs_anom[m, :, r],  fs=fs, nperseg=nperseg)
+            _, pred_psd[m, :, r] = welch(pred_anom[m, :, r], fs=fs, nperseg=nperseg)
+
+    return {"freqs": freqs, "obs_psd": obs_psd, "pred_psd": pred_psd}
+
+
+
+def compute_rank_histogram(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute rank histogram (Talagrand diagram) ranks.
+    At each (t, r), each obs member is ranked within the pred ensemble.
+
+    Memory-efficient: loops over regions to avoid large intermediate arrays.
+
+    Parameters
+    ----------
+    obs_data  : (n_obs_members, T, n_regions)
+    pred_data : (n_pred_members, T, n_regions)
+
+    Returns
+    -------
+    ranks : (n_obs_members, T, n_regions) — rank of each obs within pred ensemble
+    """
+    n_obs, T, n_regions = obs_data.shape
+    ranks       = np.zeros((n_obs, T, n_regions), dtype=int)
+    pred_sorted = np.sort(pred_data, axis=0)  # (n_pred, T, n_regions)
+
+    for r in range(n_regions):
+        # (n_obs, 1, T) > (1, n_pred, T) -> (n_obs, n_pred, T) -> sum -> (n_obs, T)
+        ranks[:, :, r] = (
+            obs_data[:, np.newaxis, :, r] > pred_sorted[np.newaxis, :, :, r]
+        ).sum(axis=1)
+
+    return ranks
+
+
+
+def compute_eof_scores(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    n_eofs: int = 5,
+) -> dict:
+    """
+    Compute EOFs of the ensemble-mean-removed data for simulation and emulation.
+
+    Parameters
+    ----------
+    obs_data  : (n_members, T, n_regions)
+    pred_data : (n_members, T, n_regions)
+    n_eofs    : number of EOFs to retain
+    """
+    def prepare(data):
+        # remove ensemble mean (forced response) to isolate internal variability
+        anom = data - data.mean(axis=0, keepdims=True)
+        n_members, T, n_regions = anom.shape
+        return anom.reshape(n_members * T, n_regions)
+
+    obs_flat  = prepare(obs_data)
+    pred_flat = prepare(pred_data)
+
+    pca_obs  = PCA(n_components=n_eofs).fit(obs_flat)
+    pca_pred = PCA(n_components=n_eofs).fit(pred_flat)
+
+    obs_eofs  = pca_obs.components_.copy()
+    pred_eofs = pca_pred.components_.copy()
+    for i in range(n_eofs):
+        if obs_eofs[i, np.argmax(np.abs(obs_eofs[i]))]  < 0:
+            obs_eofs[i]  *= -1
+        if pred_eofs[i, np.argmax(np.abs(pred_eofs[i]))] < 0:
+            pred_eofs[i] *= -1
+
+    return {
+        "obs_eofs":       obs_eofs,
+        "pred_eofs":      pred_eofs,
+        "obs_var_ratio":  pca_obs.explained_variance_ratio_,
+        "pred_var_ratio": pca_pred.explained_variance_ratio_,
+    }
+
+def lagged_correlation(x, y, max_lag=24):
+    """Correlation of x with y at lags 0, 1, ..., max_lag months."""
+    return np.array([
+        np.corrcoef(x[lag:], y[:len(x)-lag])[0,1] if lag > 0 
+        else np.corrcoef(x, y)[0,1]
+        for lag in range(max_lag + 1)
+    ])

@@ -20,6 +20,8 @@ dependencies = [
     "xarray>=2023.1",
     "pandas>=2.0",
     "statsmodels>=0.14",
+    "regionmask>=0.12.1",
+    "cartopy>=0.23.0",
 ]
 name = "emuvaluate"
 version = "0.1.0"

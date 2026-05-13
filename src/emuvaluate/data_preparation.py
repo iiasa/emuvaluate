@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from typing import Tuple
 from sklearn.linear_model import LinearRegression
+from statsmodels.tsa.seasonal import STL
 
 def weights_calculate(x0, X, tau):
     return np.exp(np.sum((X - x0) ** 2, axis=1) / (-2 * (tau ** 2)))
@@ -32,6 +33,7 @@ def local_weighted_regression(x0, X, Y, tau):
     xw = X.T * weights_calculate(x0, X, tau)
     theta = np.linalg.pinv(xw @ X) @ xw @ Y
     return x0 @ theta
+
 def local_weighted_regression_slopes(x0, X, Y, tau):
     """
     Same weighted regression as `local_weighted_regression`,
@@ -1119,3 +1121,39 @@ def load_scenarios(
 
     return data_np
 # endregion
+
+
+def deseasonalise_dataframe_STL(df, time_col="time", period=12, seasonal=241):
+    """
+    Remove a time-varying seasonal cycle using STL decomposition.
+    seasonal: window for seasonal smoother (must be odd) — 241 ~ 20 years for monthly data.
+    """
+    variable_cols = [c for c in df.columns if c != time_col]
+    
+    # enforce correct ordering
+    df = df.copy()
+    df = df.sort_values(time_col)
+
+    # optional but cleaner for time series methods
+    df = df.set_index(time_col)
+
+    deseasonalised = df.copy()
+    seasonal_df = pd.DataFrame(index=df.index)
+
+    for col in variable_cols:
+        result = STL(
+            df[col],
+            period=period,
+            seasonal=seasonal,
+            seasonal_deg=1,
+            robust=True
+        ).fit()
+        
+        deseasonalised[col] = result.resid
+        seasonal_df[col] = result.trend + result.seasonal
+
+    # restore time as column if needed
+    deseasonalised = deseasonalised.reset_index()
+    seasonal_df = seasonal_df.reset_index()
+
+    return deseasonalised, seasonal_df
