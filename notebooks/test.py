@@ -7,9 +7,9 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.1
 #   kernelspec:
-#     display_name: climate-data-processing
+#     display_name: Python 3 (ipykernel)
 #     language: python
-#     name: climate-data-processing
+#     name: python3
 # ---
 
 # %%
@@ -32,7 +32,7 @@ scenario_data = load_scenarios(
     model=MODEL,
     indicators=['tas'],
     scenarios=['ssp245'],
-    model_path=f'/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{MODEL}',
+    model_path=f'/Users/hoegner/Projects/data/CMIP6/{MODEL}/cmip6-ng-inc-oceans',
     monthly_flag=True,
     use_smoothing=False,
     train_pattern_scaling_name='ssp245',
@@ -40,7 +40,7 @@ scenario_data = load_scenarios(
 gmt_data = np.stack([lol[0,-2507:-7].transpose() for lol in scenario_data], axis=0)
 scenario_data = np.stack([lol[1:,-2507:-7].transpose() for lol in scenario_data], axis=0)
 
-pickle_filename = "/pdrive/projects/icigroup/SCALES-MESH/SCALES/emulator/ACCESS/ssp245/ssp245_ensemble40_monthly_2500m.pkl"
+pickle_filename = "/Users/hoegner/GitHub/scales_causal/outputs/ssp245_ensemble40_tas_monthly_3000m_21Apr26-monthly_variability.pkl"
 y_pred_ensemble = pickle.load(open(pickle_filename, "rb"))
 
 #y_pred_ensemble = scenario_data[20:, :, :]

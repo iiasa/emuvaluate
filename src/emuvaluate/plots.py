@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 
-from .metrics import compute_metric_all_regions, METRIC_LABELS, compute_qq_scores_all_regions, QQ_METRIC_LABELS, ERROR_METRIC_REGISTRY, linearity_score
+from .metrics import compute_metric_all_regions, METRIC_LABELS, compute_qq_scores_all_regions, QQ_METRIC_LABELS, ERROR_METRIC_REGISTRY, linearity_score, compute_psd_scores, compute_rank_histogram, compute_eof_scores, lagged_correlation
 from .transforms import preprocess, weighted_linear_smoothing
 
 import random
@@ -978,14 +978,14 @@ def _plot_qq_row(
         s=12, zorder=2, linewidths=0
     )
     if is_first_row:
-        ax_qq.set_title("QQ Plot (Sim vs Emu)", fontsize=11, fontweight="bold")
+        ax_qq.set_title("QQ Plot (Sim vs Emu)", fontsize=11)
 
     ax_qq.set_xlim(q_min - pad, q_max + pad)
     ax_qq.set_ylim(q_min - pad, q_max + pad)
-    ax_qq.set_xlabel("Simulated quantile", fontsize=8)
+    ax_qq.set_xlabel("Simulated quantile", fontsize=10)
     ax_qq.set_ylabel(
-        f"r={region_idx}\n{QQ_METRIC_LABELS.get(metric, metric)}={score:.4f}",
-        fontsize=8, rotation=0, labelpad=70,
+        f"{label}\n{QQ_METRIC_LABELS.get(metric, metric)}={score:.4f}",
+        fontsize=10, rotation=90, labelpad=15,
     )
     ax_qq.set_aspect("equal", adjustable="box")
     ax_qq.spines["top"].set_visible(False)
@@ -997,10 +997,10 @@ def _plot_qq_row(
     ax_dist.fill_between(quantiles, obs_q, pred_q, alpha=0.15, color="grey", label="Gap")
 
     if is_first_row:
-        ax_dist.set_title("Quantile Curves", fontsize=11, fontweight="bold")
+        ax_dist.set_title("Quantile Curves", fontsize=11)
         ax_dist.legend(frameon=False, fontsize=8)
 
-    ax_dist.set_xlabel("Quantile level", fontsize=8)
+    ax_dist.set_xlabel("Quantile level", fontsize=10)
     ax_dist.spines["top"].set_visible(False)
     ax_dist.spines["right"].set_visible(False)
 
@@ -1012,7 +1012,7 @@ def _plot_qq_row(
     axes_row[1].annotate(
         label,
         xy=(1.02, 0.5), xycoords="axes fraction",
-        fontsize=9, color="grey", va="center", rotation=270,
+        fontsize=10, color="grey", va="center", rotation=270,
     )
 
 
@@ -1149,6 +1149,110 @@ def plot_qq_extremes(
         "pred_qq":   pred_qq,
         "quantiles": quantiles,
     }
+
+
+def plot_qq_regions(
+    y_pred_ensemble: np.ndarray,
+    scenario_data: np.ndarray,
+    regions_to_plot: list[str],
+    region_names: list[str],
+    yearly_average: bool = False,
+    month_selection: int | None = None,
+    detrend: bool = False,
+    detrend_tau: float = 20,
+    deseasonalise: bool = False,
+    metric: str = "mae",
+    n_quantiles: int = 99,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> dict:
+    """
+    Plot QQ curves for a specified list of regions.
+
+    Parameters
+    ----------
+    y_pred_ensemble : (n_members, T, n_regions)
+    scenario_data   : (n_members, T, n_regions)
+    regions_to_plot : list of region abbreviations e.g. ["EPO", "NAO", "SAM"]
+    region_names    : full ordered list of region names (sorted(ar6_regions.abbrevs))
+    """
+    # 1. Preprocess
+    preprocess_kwargs = dict(
+        apply_yearly_average=yearly_average,
+        month_selection=month_selection,
+        apply_deseasonalise=deseasonalise,
+        apply_detrend=detrend,
+        detrend_tau=detrend_tau,
+    )
+    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
+    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
+
+    # 2. Quantile grid + scores
+    quantiles = np.linspace(0.01, 0.99, n_quantiles)
+    scores, obs_qq, pred_qq = compute_qq_scores_all_regions(obs_p, pred_p, metric, quantiles)
+
+    # 3. Resolve region indices
+    region_indices = [region_names.index(r) for r in regions_to_plot]
+    n_regions_plot = len(region_indices)
+
+    # 4. Build figure
+    fig, axes = plt.subplots(n_regions_plot, 2, figsize=(9, n_regions_plot * 2.5))
+    if n_regions_plot == 1:
+        axes = axes[np.newaxis, :]
+
+    # colorbar
+    sm = plt.cm.ScalarMappable(
+        cmap="plasma",
+        norm=plt.Normalize(vmin=quantiles.min(), vmax=quantiles.max())
+    )
+    sm.set_array([])
+
+    for k, (region_abbrev, region_idx) in enumerate(zip(regions_to_plot, region_indices)):
+        score = scores[region_idx]
+        _plot_qq_row(
+            axes_row=axes[k],
+            region_idx=region_idx,
+            score=score,
+            obs_q=obs_qq[region_idx],
+            pred_q=pred_qq[region_idx],
+            quantiles=quantiles,
+            metric=metric,
+            label=region_abbrev,
+            is_first_row=(k == 0),
+            is_last_row=(k == n_regions_plot - 1),
+        )
+
+    # 5. Title
+    parts = []
+    if yearly_average:               parts.append("Yearly Avg")
+    if month_selection is not None:  parts.append(f"Month {month_selection}")
+    if deseasonalise:                parts.append("Deseasonalised")
+    if detrend:                      parts.append(f"Detrended (τ={detrend_tau})")
+    mode_str = " | ".join(parts) if parts else "Monthly"
+
+    fig.suptitle(
+        f"QQ Plot [{mode_str}]",
+        fontsize=13, y=1.01,
+    )
+    plt.tight_layout()
+   # fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="Quantile level")
+    
+    # then add colorbar above the plots
+    cbar_ax = fig.add_axes([0.15, -0.03, 0.3, 0.02])  # [left, bottom, width, height]
+    fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="Quantile level")
+    
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        
+    plt.show()
+
+    return {
+        "scores":    scores,
+        "obs_qq":    obs_qq,
+        "pred_qq":   pred_qq,
+        "quantiles": quantiles,
+    }
+
 
 def plot_region_ensemble_extremes(
     scenario_data: np.ndarray,
@@ -1382,3 +1486,389 @@ def plot_region_ensemble_extremes(
         "best_pairs":  best_pairs,
         "worst_pairs": worst_pairs,
     }
+
+
+
+def plot_psd_comparison(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    regions_to_plot: list[str] | None = None,
+    fs: float = 1.0,
+    nperseg: int = 256,
+) -> plt.Figure:
+    """
+    Plot PSD comparison between simulation and emulation for selected regions.
+    Shading shows 10-90th percentile spread across members.
+
+    Parameters
+    ----------
+    obs_data        : (n_members, T, n_regions)
+    pred_data       : (n_members, T, n_regions)
+    region_names    : list of region name strings, length n_regions
+    regions_to_plot : which regions to plot (default: first 6)
+    fs              : sampling frequency
+    nperseg         : Welch segment length
+    """
+    if regions_to_plot is None:
+        regions_to_plot = region_names[:6]
+
+    psd = compute_psd_scores(obs_data, pred_data, fs=fs, nperseg=nperseg)
+    freqs    = psd["freqs"]
+    obs_psd  = psd["obs_psd"]
+    pred_psd = psd["pred_psd"]
+
+    # convert to period in years, mask zero frequency
+    mask = freqs > 0
+    periods = 1 / (freqs[mask] * 12)
+
+    n_plots = len(regions_to_plot)
+    ncols = 3
+    nrows = int(np.ceil(n_plots / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes = np.array(axes).flatten()
+
+    for ax, region in zip(axes, regions_to_plot):
+        r = region_names.index(region)
+        for data_psd, label, color in [
+            (obs_psd,  "Simulation", "steelblue"),
+            (pred_psd, "Emulation",  "darkorange"),
+        ]:
+            median = np.median(data_psd[:, mask, r], axis=0)
+            low    = np.percentile(data_psd[:, mask, r], 10, axis=0)
+            high   = np.percentile(data_psd[:, mask, r], 90, axis=0)
+            ax.fill_between(periods, low, high, alpha=0.25, color=color)
+            ax.plot(periods, median, color=color, label=label)
+
+        # add reference period lines — inside region loop, outside data loop
+        for period, linelabel, lcolor in [
+            (3.0, "~ENSO (3yr)", "green"),
+            (1.0, "Annual",       "grey"),
+            (0.5, "Semi-annual",  "lightgrey"),
+        ]:
+            ax.axvline(period, color=lcolor, linestyle=":", linewidth=1, label=linelabel)
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Period (years)")
+        ax.set_ylabel("PSD")
+        ax.set_title(region)
+        ax.legend(fontsize=8)
+
+    for ax in axes[n_plots:]:
+        ax.set_visible(False)
+    plt.tight_layout()
+    return fig
+
+def plot_rank_histogram(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    regions_to_plot: list[str] | None = None,
+) -> plt.Figure:
+    if regions_to_plot is None:
+        regions_to_plot = region_names[:6]
+
+    n_pred  = pred_data.shape[0]
+    ranks   = compute_rank_histogram(obs_data, pred_data)  # (n_obs, T, n_regions)
+
+    n_plots = len(regions_to_plot)
+    ncols   = 3
+    nrows   = int(np.ceil(n_plots / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes = np.array(axes).flatten()
+
+    for ax, region in zip(axes, regions_to_plot):
+        r      = region_names.index(region)
+        r_ranks = ranks[:, :, r].flatten()  # (n_obs * T,)
+        ax.hist(r_ranks, bins=n_pred + 1, range=(-0.5, n_pred + 0.5),
+                density=True, color="steelblue", edgecolor="white")
+        ax.axhline(1 / (n_pred + 1), color="red", linestyle="--", label="Uniform (ideal)")
+        ax.set_title(region)
+        ax.set_xlabel("Rank")
+        ax.set_ylabel("Frequency")
+        ax.legend(fontsize=8)
+
+    for ax in axes[n_plots:]:
+        ax.set_visible(False)
+
+    plt.tight_layout()
+    return fig
+
+
+
+def plot_eof_comparison(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    n_eofs: int = 3,
+) -> plt.Figure:
+    """
+    Plot leading EOFs side by side for simulation and emulation,
+    with explained variance fractions in the title.
+
+    Parameters
+    ----------
+    obs_data     : (n_members, T, n_regions)
+    pred_data    : (n_members, T, n_regions)
+    region_names : list of region name strings
+    n_eofs       : number of EOFs to plot
+    """
+    eof = compute_eof_scores(obs_data, pred_data, n_eofs=n_eofs)
+
+    fig, axes = plt.subplots(n_eofs, 2, figsize=(14, 4 * n_eofs))
+    if n_eofs == 1:
+        axes = axes[np.newaxis, :]
+
+    for i in range(n_eofs):
+        for ax, eofs, var_ratio, label, color in zip(
+            axes[i],
+            [eof["obs_eofs"],  eof["pred_eofs"]],
+            [eof["obs_var_ratio"], eof["pred_var_ratio"]],
+            ["Simulation", "Emulation"],
+            ["steelblue",  "darkorange"],
+        ):
+            ax.bar(range(len(region_names)), eofs[i], color=color, alpha=0.7)
+            ax.set_xticks(range(len(region_names)))
+            ax.set_xticklabels(region_names, rotation=90, fontsize=6)
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_title(f"{label} EOF{i+1} ({var_ratio[i]*100:.1f}% variance explained)")
+
+    plt.tight_layout()
+    return fig
+
+
+    
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+from matplotlib.colors import TwoSlopeNorm
+import regionmask
+import xarray as xr
+
+def plot_eof_comparison_map(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    n_eofs: int = 3,
+    cmap: str = "RdBu_r",
+    projection=None,
+) -> plt.Figure:
+    eof = compute_eof_scores(obs_data, pred_data, n_eofs=n_eofs)
+
+    if projection is None:
+        projection = ccrs.Robinson()
+
+    ar6 = regionmask.defined_regions.ar6.all
+    abbrevs = sorted(ar6.abbrevs)
+
+    # Enforce that your region_names = sorted(ar6.abbrevs)
+    if list(region_names) != abbrevs:
+        raise ValueError(
+            "region_names must be exactly sorted(ar6.abbrevs).\n"
+            f"Got: {region_names}\n"
+            f"Expected: {abbrevs}"
+        )
+
+    # map abbrev -> index in your data
+    abbrev_to_idx = {abbr: i for i, abbr in enumerate(region_names)}
+    # map abbrev -> AR6 region number (not loop index)
+    abbrev_to_number = {abbr: ar6[abbr].number for abbr in abbrevs}
+
+    # dummy grid
+    ds = xr.Dataset(
+        coords={
+            "lon": np.linspace(-179.5, 179.5, 720),
+            "lat": np.linspace(-89.5, 89.5, 360),
+        }
+    )
+    mask = ar6.mask(ds)
+
+    fig, axes = plt.subplots(
+        n_eofs, 2,
+        figsize=(16, 5 * n_eofs),
+        subplot_kw={"projection": projection},
+    )
+    if n_eofs == 1:
+        axes = np.array([axes])
+
+    last_im = None
+
+    for i in range(n_eofs):
+        for ax, eofs, var_ratio, title_prefix in zip(
+            axes[i],
+            [eof["obs_eofs"], eof["pred_eofs"]],
+            [eof["obs_var_ratio"], eof["pred_var_ratio"]],
+            ["Simulation", "Emulation"],
+        ):
+            vals = np.array([eofs[i, abbrev_to_idx[a]] for a in abbrevs], dtype=float)
+            vmax = np.nanmax(np.abs(vals))
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+
+            # initialize with NaNs
+            region_values = xr.full_like(mask, np.nan, dtype=float)
+
+            # assign each region by its true AR6 number, not loop index
+            for abbr, val in zip(abbrevs, vals):
+                region_values = region_values.where(mask != abbrev_to_number[abbr], val)
+
+            last_im = ax.pcolormesh(
+                ds.lon,
+                ds.lat,
+                region_values,
+                transform=ccrs.PlateCarree(),
+                cmap=cmap,
+                norm=norm,
+                shading="auto",
+            )
+
+            ar6.plot(
+                ax=ax,
+                add_label=False,
+                add_coastlines=True,
+                add_ocean=False,
+                add_land=False,
+                line_kws={"color": "black", "linewidth": 0.35},
+            )
+            ax.set_title(f"{title_prefix} EOF{i+1} ({var_ratio[i]*100:.1f}% variance explained)")
+            ax.set_global()
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])  # bottom 12%; minimal top
+    
+    pos = axes[-1, 0].get_position()
+    
+    cbar_height = 0.02
+    cbar_width  = pos.width
+    cbar_bottom = 0.05
+    cbar_left   = pos.x0 + cbar_width/2
+    
+    cbar_ax = fig.add_axes([
+        cbar_left,
+        cbar_bottom,
+        cbar_width,
+        cbar_height,
+    ])
+    fig.colorbar(last_im, cax=cbar_ax, orientation="horizontal", label="EOF loading")
+    
+    return fig
+
+
+
+def plot_teleconnection_comparison(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    index_regions: list[str],
+    target_regions: list[str] | None = None,
+) -> plt.Figure:
+    """
+    Compare instantaneous teleconnection patterns between simulation and emulation,
+    after removing the ensemble mean (forced response) to isolate internal variability.
+
+    obs_data, pred_data: (n_members, T, n_regions)
+    index_regions: driving regions (e.g. ["EPO", "EAO"])
+    target_regions: regions to correlate against (default: all)
+    """
+    # remove ensemble mean to isolate internal variability
+    obs_anom  = obs_data  - obs_data.mean(axis=0, keepdims=True)
+    pred_anom = pred_data - pred_data.mean(axis=0, keepdims=True)
+
+    # pool across members
+    n_members, T, n_regions = obs_data.shape
+    obs_flat  = obs_anom.reshape(n_members * T, n_regions)
+    pred_flat = pred_anom.reshape(n_members * T, n_regions)
+
+    if target_regions is None:
+        target_regions = region_names
+
+    n_plots = len(index_regions)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 4 * n_plots))
+    if n_plots == 1:
+        axes = [axes]
+
+    for ax, index_region in zip(axes, index_regions):
+        x = np.arange(len(target_regions))
+        idx = region_names.index(index_region)
+
+        obs_corrs  = np.array([
+            np.corrcoef(obs_flat[:, idx], obs_flat[:, region_names.index(t)])[0, 1]
+            for t in target_regions
+            if t != index_region  # exclude self-correlation
+        ])
+        pred_corrs = np.array([
+            np.corrcoef(pred_flat[:, idx], pred_flat[:, region_names.index(t)])[0, 1]
+            for t in target_regions
+            if t != index_region
+        ])
+
+        target_regions_plot = [t for t in target_regions if t != index_region]
+        x = np.arange(len(target_regions_plot))
+
+        ax.bar(x - 0.2, obs_corrs,  0.4, label="Simulation", color="steelblue",  alpha=0.7)
+        ax.bar(x + 0.2, pred_corrs, 0.4, label="Emulation",  color="darkorange", alpha=0.7)
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(target_regions_plot, rotation=90, fontsize=6)
+        ax.set_title(f"Teleconnections from {index_region} (ensemble-mean removed)")
+        ax.set_ylabel("Correlation")
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    return fig
+    
+
+
+def plot_lagged_correlations(
+    obs_data: np.ndarray,
+    pred_data: np.ndarray,
+    region_names: list[str],
+    index_region: str,
+    target_regions: list[str] | None = None,
+    max_lag: int = 24,
+) -> plt.Figure:
+    # remove ensemble mean
+    obs_anom  = obs_data  - obs_data.mean(axis=0, keepdims=True)
+    pred_anom = pred_data - pred_data.mean(axis=0, keepdims=True)
+    n_members, T, n_regions = obs_data.shape
+    
+    if target_regions is None:
+        target_regions = region_names[:6]
+
+    idx  = region_names.index(index_region)
+    lags = np.arange(max_lag + 1)
+
+    n_plots = len(target_regions)
+    ncols   = 3
+    nrows   = int(np.ceil(n_plots / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes = np.array(axes).flatten()
+
+    for ax, target in zip(axes, target_regions):
+        t = region_names.index(target)
+
+        obs_lc  = np.mean([
+            lagged_correlation(obs_anom[m, :, idx], obs_anom[m, :, t], max_lag)
+            for m in range(obs_anom.shape[0])
+        ], axis=0)
+
+        pred_lc = np.mean([
+            lagged_correlation(pred_anom[m, :, idx], pred_anom[m, :, t], max_lag)
+            for m in range(pred_anom.shape[0])
+        ], axis=0)
+
+        ax.plot(lags, obs_lc,  color="steelblue",  label="Simulation")
+        ax.plot(lags, pred_lc, color="darkorange", label="Emulation")
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.axhline( 1.96 / np.sqrt(T), color="steelblue", linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.axhline(-1.96 / np.sqrt(T), color="steelblue", linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.set_xlabel("Lag (months)")
+        ax.set_ylabel("Correlation")
+        ax.set_title(f"{index_region} → {target} (ensemble-mean removed)")
+        ax.legend(fontsize=8)
+
+    for ax in axes[n_plots:]:
+        ax.set_visible(False)
+
+    plt.tight_layout()
+    return fig
+
