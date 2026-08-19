@@ -1,25 +1,27 @@
-import xarray as xr
-import scipy
-import numpy as np
-import pandas as pd
+"""
+data_preparation.py
+-------------------
+Load raw CMIP6-ng scenario files off disk and turn them into the
+``(n_members, T, n_regions)`` ensemble arrays the rest of the package works
+with.
+
+`load_scenarios` is the entry point; everything else here is a step it calls:
+file discovery and baseline matching (`get_all_files_`,
+`filter_climate_files`, `get_baseline_filename`, `parse_filename`),
+per-scenario reading and baseline subtraction (`process_scenarios`), and the
+final stacking into arrays (`process_gmt_and_regions_into_array`).
+"""
+
 import copy
+import os
+import re
 from datetime import datetime
-import matplotlib.pyplot as plt
-import os
-import re
-from typing import List, Optional
-import pandas as pd
-import numpy as np
-from scipy.sparse import diags
-import matplotlib.pyplot as plt
-import os
-import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Tuple
 from sklearn.linear_model import LinearRegression
-from statsmodels.tsa.seasonal import STL
+
 
 def weights_calculate(x0, X, tau):
     return np.exp(np.sum((X - x0) ** 2, axis=1) / (-2 * (tau ** 2)))
@@ -34,21 +36,6 @@ def local_weighted_regression(x0, X, Y, tau):
     theta = np.linalg.pinv(xw @ X) @ xw @ Y
     return x0 @ theta
 
-def local_weighted_regression_slopes(x0, X, Y, tau):
-    """
-    Same weighted regression as `local_weighted_regression`,
-    but returns only the slope coefficients (excluding intercept).
-    """
-    # Add bias term consistently (same as original function)
-    x0 = np.r_[1, x0]
-    X = np.c_[np.ones(len(X)), X]
-
-    # Weighted least squares (same as original)
-    xw = X.T * weights_calculate(x0, X, tau)
-    theta = np.linalg.pinv(xw @ X) @ xw @ Y
-
-    # Return only slopes (excluding intercept)
-    return np.squeeze(theta[1:])
 
 def parse_filename(filename: str) -> Optional[dict]:
     """
@@ -133,69 +120,6 @@ def smooth_regional_indicator_timeseries(regional_indicator, bandwidth=20, is_mo
 
     return smoothed
 
-def get_baseline_filename(filename: str, path: str = ".") -> Optional[str]:
-    """
-    Finds the baseline file for a given scenario file.
-    - For SSP scenarios: returns historical file with same ensemble and indicator
-    - For non-SSP scenarios: returns piControl file with same ensemble and indicator
-    - If no exact match exists for non-SSP: returns piControl with different ensemble but same indicator
-    
-    Args:
-        filename: The scenario filename
-        path: Directory path where files are located
-    
-    Returns:
-        The baseline filename if found, None otherwise
-    """
-    # Parse the input filename
-    components = parse_filename(filename)
-    
-    if not components:
-        print(f"Error: Could not parse filename '{filename}'")
-        return None
-    
-    # Check if the scenario contains 'ssp'
-    if 'ssp' in components['scenario'].lower():
-        # For SSP scenarios, use historical
-        baseline_scenario = 'historical'
-    else:
-        # For non-SSP scenarios, use piControl
-        baseline_scenario = 'picontrol'
-    
-    # Construct the baseline filename with same ensemble
-    baseline_filename = (
-        f"{components['model']}_{baseline_scenario}-{components['ensemble']}_"
-        f"{components['indicator']}_ipcc-regions_latweight.csv"
-    )
-    
-    # Check if the baseline file exists
-    baseline_path = os.path.join(path, baseline_filename)
-    if os.path.exists(baseline_path):
-        return baseline_filename
-    
-    # If not found and it's piControl, try to find one with a different ensemble
-    if baseline_scenario == 'picontrol':
-        try:
-            all_files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
-            
-            # Look for any piControl file with the same model and indicator
-            pattern = rf'^{re.escape(components["model"])}_picontrol-(.+?)_{re.escape(components["indicator"])}_ipcc-regions_latweight\.csv$'
-            
-            for file in all_files:
-                match = re.match(pattern, file)
-                if match:
-                    print(f"Info: Exact ensemble match not found. Using '{file}' with different ensemble")
-                    return file
-            
-            print(f"Warning: No piControl baseline file found for indicator '{components['indicator']}' in '{path}'")
-            return None
-            
-        except (FileNotFoundError, PermissionError) as e:
-            print(f"Error accessing path: {e}")
-            return None
-    else:
-        print(f"Warning: Baseline file '{baseline_filename}' not found in '{path}'")
-        return None
 
 
 
@@ -221,7 +145,8 @@ def filter_climate_files(
     scenarios: Optional[List[str]] = None,
     ensembles: Optional[List[str]] = None,
     indicators: Optional[List[str]] = None,
-    models: Optional[List[str]] = None
+    models: Optional[List[str]] = None,
+    only_one: bool = False,
 ) -> List[str]:
     """
     Filters files matching the pattern:
@@ -253,6 +178,8 @@ def filter_climate_files(
             if indicators and indicator not in indicators:
                 continue
             if models and model not in models:
+                continue
+            if only_one and any(scenario in f for f in matching_files):
                 continue
 
             matching_files.append(filename)
@@ -505,7 +432,6 @@ def detect_is_monthly(df, gmt_df):
     # Default fallback
     return False
 
-import pandas as pd
 
 def expand_annual_to_monthly(series: pd.Series) -> pd.Series:
     """
@@ -592,7 +518,6 @@ def expand_annual_to_monthly(series: pd.Series) -> pd.Series:
 #        intercepts[i] = model.intercept_
 #
 #    return slopes, intercepts
-import numpy as np
 
 def predict_regional_temperatures(
     global_test_series,
@@ -823,167 +748,10 @@ def process_gmt_and_regions_into_array(
 
 
 
-def prepare_train_data(data,n):
-    """ 
-    data: array with shape (1 + number_regions, number_timesteps)
-    n: window size length
-    """
-    regions, timesteps = data.shape
-    first_region = data[0]   # shape: (timesteps,)
-    other_regions = data[1:] # shape: (number_regions, timesteps)
 
-    # Number of valid training windows
-    num_samples = timesteps - n - 1
 
-    # X shape target: (regions, n, num_samples)
-    X = np.zeros((regions, n, num_samples))
 
-    for i in range(num_samples):  # x goes from n to timesteps-1
-        # First region: t[x-n] ... t[x]  (length n)
-        X[0, :, i] = first_region[(i+1):(i+n+1)]
 
-        # Other regions: t[x-n-1] ... t[x-1] (also length n)
-        X[1:, :, i] = other_regions[:, i:(i+n)]
-
-    # Y shape target: (number_regions, num_samples)
-    Y = np.zeros((regions - 1, num_samples))
-
-    # At time t[x], take all region values except the first one
-    Y[:, :] = other_regions[:, (n+1):]  # n to end: timesteps - n samples
-
-    return X, Y
-
-def prepare_all_train_data(data_arrays, n):
-    """
-    data_arrays: list of arrays, each shape (1 + number_regions, number_timesteps)
-    n: window size length
-    """
-
-    X_list = []
-    Y_list = []
-
-    for data in data_arrays:
-        
-        X, Y = prepare_train_data(data,n)
-
-        X_list.append(X)
-        Y_list.append(Y)
-
-    # Combine multiple samples along the third dimension
-    X_combined = np.concatenate(X_list, axis=2)  
-    Y_combined = np.concatenate(Y_list, axis=1)
-
-    return X_combined, Y_combined
-
-def shuffle_train_data(X, Y, random_state=None):
-    """
-    Shufflestraining data together so their sample alignment stays correct.
-
-    X shape: (features, n, samples)
-    Y shape: (targets, samples)
-
-    Returns: shuffled X and Y
-    """
-    if random_state is not None:
-        np.random.seed(random_state)
-
-    num_samples = X.shape[2]
-    indices = np.random.permutation(num_samples)
-
-    X_shuffled = X[:, :, indices]   # shuffle along last axis
-    Y_shuffled = Y[:, indices]      # shuffle along last axis
-
-    return X_shuffled, Y_shuffled
-
-def prepare_scenario_data(
-    model,
-    indicator,
-    scenarios,
-    model_path,
-    pattern_scaling_residuals=False,
-    ramp_down_corrected_ps=False,
-    monthly_flag=False,
-    use_smoothing=True,
-    train_pattern_scaling_name=None,
-):
-    """
-    Runs the full data preparation pipeline for climate emulation.
-
-    Parameters
-    ----------
-    model : str
-        CMIP6 model name (e.g. 'ACCESS-ESM1-5')
-    indicator : str
-        Climate indicator (e.g. 'tas')
-    scenarios : list of str
-        Scenario names to process
-    model_path : str
-        Path to the model data directory
-    pattern_scaling_residuals : bool
-        Whether to use pattern scaling residuals
-    ramp_down_corrected_ps : bool
-        Whether to apply ramp-down correction for pattern scaling
-    monthly_flag : bool
-        Whether to use monthly trend
-    use_smoothing : bool
-        Whether to apply smoothing
-    train_pattern_scaling_name : str
-        Scenario name used as reference for pattern scaling
-
-    Returns
-    -------
-    list
-        data_np — one entry per scenario
-    """
-    if train_pattern_scaling_name is None: 
-        train_pattern_scaling_name = scenarios[0]
-        
-    potential_files = get_all_files_(model_path)
-
-    files = filter_climate_files(files=potential_files, scenarios=scenarios, indicators=[indicator])
-
-    files_with_baseline = [(get_baseline_filename(filename=f, files=potential_files), f) for f in files]
-
-    data_df = [
-        process_scenarios(
-            experiment_scenario_path=f'{model_path}/{experiment}',
-            simulation_name=experiment,
-            baseline_scenario_path=f'{model_path}/{baseline}',
-            delete_first_years=0,
-            monthly_trend=monthly_flag,
-            smoothed=use_smoothing
-        )
-        for baseline, experiment in files_with_baseline
-    ]
-
-    flat10cdr_index = [i for i, f in enumerate(files) if train_pattern_scaling_name in f][0]
-    regional_regression_slopes_intercepts = process_gmt_and_regions_into_array(
-        data_df[flat10cdr_index],
-        weighted_linear_smoothing=False,
-        pattern_scaling_residuals=True,
-        ramp_down_corrected_ps=ramp_down_corrected_ps
-    )
-
-    if pattern_scaling_residuals:
-        data_np = [
-            process_gmt_and_regions_into_array(
-                d, weighted_linear_smoothing=False,
-                pattern_scaling_residuals=True,
-                slope_intercept=regional_regression_slopes_intercepts,
-                ramp_down_corrected_ps=ramp_down_corrected_ps
-            )
-            for d in data_df
-        ]
-    else:
-        data_np = [
-            process_gmt_and_regions_into_array(
-                d, weighted_linear_smoothing=False,
-                ramp_down_corrected_ps=ramp_down_corrected_ps
-            )
-            for d in data_df
-        ]
-
-    return data_np
 
 def load_scenarios(
     model,
@@ -1123,37 +891,3 @@ def load_scenarios(
 # endregion
 
 
-def deseasonalise_dataframe_STL(df, time_col="time", period=12, seasonal=241):
-    """
-    Remove a time-varying seasonal cycle using STL decomposition.
-    seasonal: window for seasonal smoother (must be odd) — 241 ~ 20 years for monthly data.
-    """
-    variable_cols = [c for c in df.columns if c != time_col]
-    
-    # enforce correct ordering
-    df = df.copy()
-    df = df.sort_values(time_col)
-
-    # optional but cleaner for time series methods
-    df = df.set_index(time_col)
-
-    deseasonalised = df.copy()
-    seasonal_df = pd.DataFrame(index=df.index)
-
-    for col in variable_cols:
-        result = STL(
-            df[col],
-            period=period,
-            seasonal=seasonal,
-            seasonal_deg=1,
-            robust=True
-        ).fit()
-        
-        deseasonalised[col] = result.resid
-        seasonal_df[col] = result.trend + result.seasonal
-
-    # restore time as column if needed
-    deseasonalised = deseasonalised.reset_index()
-    seasonal_df = seasonal_df.reset_index()
-
-    return deseasonalised, seasonal_df

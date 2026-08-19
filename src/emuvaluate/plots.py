@@ -1,1874 +1,1841 @@
 """
-plotting/extremes.py
----------------------
-Visualise the best and worst emulated regions according to a chosen metric.
+plots.py
+--------
+Every figure this package produces. Pure plotting: nothing here preprocesses
+an ensemble or computes a score. Each function is handed an `ErrorData` (or
+one of the two plain dicts) already built by `metrics.py`, and only decides
+how to lay it out.
+
+The figures come in four shapes:
+
+  maps            `plot_map_regional`, `plot_map_gridded`
+                  one column per indicator, one row per comparison.
+
+  bars            `bar_plot_regional`
+                  the map's data as a grouped bar chart — all comparisons
+                  side by side per region.
+
+  matrix          `plot_error_matrix_regional`
+                  many models at once: regions across the columns, one row
+                  per (model, indicator, comparison), error value as colour.
+
+  ranking grids   `plot_timeseries_regional`, `plot_timeseries_gridded`,
+                  `plot_qq_scatter`, `plot_temporal_correlation_curves`,
+                  `plot_psd_curves`
+                  one row per indicator, one column per selected unit. By
+                  default the columns are the best / median / worst unit by
+                  `error_data.ranking`; pass `selection=` to choose units
+                  yourself. All of them accept `share_y_per_row`.
+
+  aggregates      `plot_correlation_comparison` (regional only),
+                  `plot_crps_timeseries_gridded`
+                  figures where the unit axis has already been collapsed.
+
+Indicators
+----------
+Everything is indicator-generic. `error_data.indicators` drives how many
+columns a map has and how many rows a ranking grid has, in the order the
+`ErrorData` was built with. Two indicators named "tas" and "pr" is the
+default, but one indicator, or five, works the same way — see
+`metrics.build_error_data_regional`'s `indicators` / `indicator_labels` /
+`indicator_units` parameters for naming them.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.gridspec as mgridspec
 import matplotlib.lines as mlines
-
-from .metrics import compute_metric_all_regions, METRIC_LABELS, compute_qq_scores_all_regions, QQ_METRIC_LABELS, ERROR_METRIC_REGISTRY, linearity_score, compute_psd_scores, compute_rank_histogram, compute_eof_scores, lagged_correlation
-from .transforms import preprocess, weighted_linear_smoothing
-
-import random
-import numpy as np
-import matplotlib.pyplot as plt
-
-def plot_gmt_vs_regional(
-    gmt: np.ndarray,
-    regional_data: dict[str, np.ndarray],
-    region_indices: list[int] | None = None,
-    sample_indices: list[int] | None = None,
-    n_random: int | None = None,
-    region_names: list[str] | None = None,
-    title: str | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-    seed: int = 42,
-) -> plt.Figure:
-    """
-    Plot regional values on the y-axis against GMT on the x-axis for
-    multiple data sources.
-
-    Parameters
-    ----------
-    gmt             : (T,) or (n_samples, T) — GMT timeseries
-    regional_data   : dict of name → (n_samples, T, n_regions) or (T, n_regions)
-    region_indices  : list of region indices to plot. If None, uses n_random
-    sample_indices  : list of sample indices to plot. If None, uses n_random
-                      or all samples for 2-D inputs
-    n_random        : if region_indices or sample_indices is None, sample
-                      this many randomly instead
-    region_names    : list of region label strings. If len matches
-                      len(region_indices), treated as already-resolved labels
-                      for the selected regions. Otherwise treated as full list.
-    title           : optional figure title
-    save_path       : path to save figure
-    dpi             : resolution for saved figure
-    seed            : random seed for reproducibility
-
-    Returns
-    -------
-    matplotlib Figure
-    """
-    rng = np.random.default_rng(seed)
-    gmt = np.asarray(gmt)
-
-    # ── Normalise all inputs to (n_samples, T, n_regions) ────────────────────
-    normalised = {}
-    for name, data in regional_data.items():
-        data = np.asarray(data)
-        if data.ndim == 2:
-            normalised[name] = data[np.newaxis, :, :]
-        elif data.ndim == 3:
-            normalised[name] = data
-        else:
-            raise ValueError(f"'{name}': expected 2-D or 3-D array, got shape {data.shape}")
-
-    ref_data                  = next(iter(normalised.values()))
-    n_samples_ref, T, n_regions = ref_data.shape
-
-    gmt_3d = np.tile(gmt, (n_samples_ref, 1)) if gmt.ndim == 1 else gmt
-
-    # ── Resolve which regions and samples to plot ─────────────────────────────
-    if region_indices is None:
-        n_pick         = n_random if n_random is not None else min(3, n_regions)
-        region_indices = rng.choice(n_regions, size=min(n_pick, n_regions), replace=False).tolist()
-
-    if sample_indices is None:
-        n_pick         = n_random if n_random is not None else min(3, n_samples_ref)
-        sample_indices = rng.choice(n_samples_ref, size=min(n_pick, n_samples_ref), replace=False).tolist()
-
-    n_reg = len(region_indices)
-
-    # ── Resolve labels ────────────────────────────────────────────────────────
-    if region_names is not None and len(region_names) == n_reg:
-        # Already-resolved labels for the selected regions
-        plot_labels = list(region_names)
-    else:
-        full_labels = region_names if region_names is not None else [str(i) for i in range(n_regions)]
-        plot_labels = [full_labels[i] for i in region_indices]
-
-    # ── Colour per source ─────────────────────────────────────────────────────
-    source_colors = {
-        name: plt.get_cmap("tab10").colors[k % 10]
-        for k, name in enumerate(normalised.keys())
-    }
-
-    # ── Figure ────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, n_reg, figsize=(5 * n_reg, 4), sharey=False)
-    if n_reg == 1:
-        axes = [axes]
-
-    for col, region_idx in enumerate(region_indices):
-        ax = axes[col]
-
-        for name, data in normalised.items():
-            color = source_colors[name]
-            n_s   = data.shape[0]
-
-            for s_idx in sample_indices:
-                if s_idx >= n_s:
-                    continue
-                g = gmt_3d[s_idx] if gmt_3d.shape[0] > 1 else gmt_3d[0]
-                y = data[s_idx, :, region_idx]
-                ax.scatter(
-                    g, y,
-                    color=color, s=4, alpha=0.3,
-                    label=name if s_idx == sample_indices[0] else "_nolegend_",
-                )
-
-            valid_samples = [s for s in sample_indices if s < n_s]
-            if valid_samples:
-                g_mean   = gmt_3d[valid_samples].mean(axis=0) if gmt_3d.shape[0] > 1 else gmt_3d[0]
-                y_median = np.median(data[valid_samples, :, region_idx], axis=0)
-                ax.scatter(g_mean, y_median, color=color, s=12, alpha=0.9, zorder=3)
-
-                sort_idx = np.argsort(g_mean)
-                m, b     = np.polyfit(g_mean, y_median, 1)
-                ax.plot(
-                    g_mean[sort_idx],
-                    m * g_mean[sort_idx] + b,
-                    color=color, linewidth=1.5, linestyle="--", alpha=0.8,
-                )
-
-        ax.set_xlabel("GMT", fontsize=10)
-        ax.set_title(plot_labels[col], fontsize=10)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        if col == 0:
-            ax.set_ylabel("Regional value", fontsize=10)
-
-    handles, leg_labels = axes[0].get_legend_handles_labels()
-    seen = {}
-    for h, l in zip(handles, leg_labels):
-        if l not in seen:
-            seen[l] = h
-    axes[0].legend(seen.values(), seen.keys(), frameon=False, fontsize=9)
-
-    fig.suptitle(title or "Regional values vs GMT", fontsize=12, y=1.02)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return fig
-
-
-def plot_gmt_vs_regional_linearity_extremes(
-    gmt: np.ndarray,
-    regional_data: dict[str, np.ndarray],
-    n_examples: int = 5,
-    sample_indices: list[int] | None = None,
-    n_random_samples: int = 5,
-    region_names: list[str] | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-    seed: int = 42,
-) -> dict:
-    """
-    Rank regions by linearity of their GMT–regional relationship and plot
-    the n most and least linear regions using plot_gmt_vs_regional.
-
-    Linearity is measured using the R² of a linear fit between GMT and the
-    regional values of the first source in regional_data.
-
-    Parameters
-    ----------
-    gmt              : (T,) or (n_samples, T)
-    regional_data    : dict of name → (n_samples, T, n_regions) or (T, n_regions)
-                       linearity is ranked using the first entry
-    n_examples       : number of most / least linear regions to show
-    sample_indices   : fixed sample indices to use; if None, uses n_random_samples
-    n_random_samples : number of random samples to draw if sample_indices is None
-    region_names     : list of region label strings
-    save_path        : base path for saving — '_most_linear' and '_least_linear'
-                       are appended before the extension
-    dpi              : resolution for saved figure
-    seed             : random seed
-
-    Returns
-    -------
-    dict with keys:
-        'linearity_scores' : np.ndarray (n_regions,)
-        'most_linear'      : list of (region_idx, score)
-        'least_linear'     : list of (region_idx, score)
-    """
-    from .metrics import linearity_score
-
-    rng = np.random.default_rng(seed)
-    gmt = np.asarray(gmt)
-
-    ref_name, ref_data = next(iter(regional_data.items()))
-    ref_data = np.asarray(ref_data)
-    if ref_data.ndim == 2:
-        ref_data = ref_data[np.newaxis, :, :]
-
-    n_samples, T, n_regions = ref_data.shape
-    gmt_2d = np.tile(gmt, (n_samples, 1)) if gmt.ndim == 1 else gmt
-
-    # ── Score linearity per region ────────────────────────────────────────────
-    scores = np.array([
-        linearity_score(ref_data[:, :, r], gmt_2d)
-        for r in range(n_regions)
-    ])
-
-    # ── Rank ──────────────────────────────────────────────────────────────────
-    sorted_idx   = np.argsort(scores)
-    least_linear = [(int(i), float(scores[i])) for i in sorted_idx[:n_examples]]
-    most_linear  = [(int(i), float(scores[i])) for i in sorted_idx[-n_examples:][::-1]]
-
-    if sample_indices is None:
-        sample_indices = rng.choice(
-            n_samples, size=min(n_random_samples, n_samples), replace=False
-        ).tolist()
-
-    def _save_path(suffix):
-        if save_path is None:
-            return None
-        base, ext = (save_path.rsplit(".", 1) if "." in save_path else (save_path, "png"))
-        return f"{base}_{suffix}.{ext}"
-
-    # ── Plot most linear ──────────────────────────────────────────────────────
-    most_region_indices = [i for i, _ in most_linear]
-    most_region_labels  = [
-        f"{region_names[i] if region_names else i} (R²={s:.2f})"
-        for i, s in most_linear
-    ]
-    plot_gmt_vs_regional(
-        gmt=gmt,
-        regional_data=regional_data,
-        region_indices=most_region_indices,
-        sample_indices=sample_indices,
-        region_names=most_region_labels,
-        title=f"Most linear regions — ranked by R² of {ref_name} vs GMT",
-        save_path=_save_path("most_linear"),
-        dpi=dpi,
-        seed=seed,
-    )
-
-    # ── Plot least linear ─────────────────────────────────────────────────────
-    least_region_indices = [i for i, _ in least_linear]
-    least_region_labels  = [
-        f"{region_names[i] if region_names else i} (R²={s:.2f})"
-        for i, s in least_linear
-    ]
-    plot_gmt_vs_regional(
-        gmt=gmt,
-        regional_data=regional_data,
-        region_indices=least_region_indices,
-        sample_indices=sample_indices,
-        region_names=least_region_labels,
-        title=f"Least linear regions — ranked by R² of {ref_name} vs GMT",
-        save_path=_save_path("least_linear"),
-        dpi=dpi,
-        seed=seed,
-    )
-
-    return {
-        "linearity_scores": scores,
-        "most_linear":      most_linear,
-        "least_linear":     least_linear,
-    }
-
-def plot_gmt_phases(
-    gmt: np.ndarray,
-    split_points: list[int],
-    phases: list[str] | None = None,
-    tau: float = 20,
-    smooth: bool = True,
-    title: str | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> plt.Figure:
-    """
-    Plot a GMT timeseries with phase splits highlighted.
-
-    Parameters
-    ----------
-    gmt          : (T,) GMT timeseries
-    split_points : list of int — split indices along T
-    phases       : optional list of len(split_points) + 1 phase label strings
-                   e.g. ['stable', 'ramp-up', 'ramp-down', 'stable']
-    tau          : smoothing bandwidth (only used if smooth=True)
-    smooth       : whether to overlay the smoothed GMT
-    title        : optional figure title
-    save_path    : path to save figure
-    dpi          : resolution for saved figure
-
-    Returns
-    -------
-    matplotlib Figure
-    """
-    gmt = np.asarray(gmt).ravel()
-    T   = len(gmt)
-
-    PHASE_COLORS = {
-        "ramp-up":   "#d62728",
-        "ramp-down": "#1f77b4",
-        "stable":    "#2ca02c",
-    }
-    DEFAULT_COLORS = plt.get_cmap("tab10").colors
-
-    n_segments = len(split_points) + 1
-    if phases is not None and len(phases) != n_segments:
-        raise ValueError(
-            f"len(phases)={len(phases)} must equal len(split_points)+1={n_segments}"
-        )
-
-    boundaries = [0] + list(split_points) + [T]
-
-    y_min = gmt.min()
-    y_max = gmt.max()
-    y_pad = (y_max - y_min) * 0.05
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-
-    # ── Shaded phase regions ──────────────────────────────────────────────────
-    for k in range(n_segments):
-        t_start = boundaries[k]
-        t_end   = boundaries[k + 1]
-        label   = phases[k] if phases is not None else f"Segment {k + 1}"
-        color   = (
-            PHASE_COLORS.get(label, DEFAULT_COLORS[k % len(DEFAULT_COLORS)])
-            if phases is not None
-            else DEFAULT_COLORS[k % len(DEFAULT_COLORS)]
-        )
-        ax.axvspan(t_start, t_end, alpha=0.12, color=color, label=label, zorder=0)
-
-    # ── Raw GMT ───────────────────────────────────────────────────────────────
-    ax.plot(
-        np.arange(T), gmt,
-        color="grey", linewidth=0.8, alpha=0.6, zorder=1, label="GMT (raw)"
-    )
-
-    # ── Smoothed GMT ──────────────────────────────────────────────────────────
-    if smooth:
-        gmt_smooth = weighted_linear_smoothing(gmt, tau=tau)
-        ax.plot(
-            np.arange(T), gmt_smooth,
-            color="black", linewidth=1.8, zorder=2, label=f"GMT (smoothed, τ={tau})"
-        )
-
-    # ── Split point vertical lines + labels ───────────────────────────────────
-    for sp in split_points:
-        ax.axvline(x=sp, color="black", linewidth=1.2, linestyle="--", alpha=0.7, zorder=3)
-        ax.text(
-            sp, y_max + y_pad,
-            f"  t={sp}",
-            fontsize=8, color="black", va="top", rotation=90,
-        )
-
-    # ── Phase labels centred in each band ─────────────────────────────────────
-    y_label = y_min + (y_max - y_min) * 0.05
-    for k in range(n_segments):
-        t_mid = (boundaries[k] + boundaries[k + 1]) / 2
-        label = phases[k] if phases is not None else f"Segment {k + 1}"
-        color = (
-            PHASE_COLORS.get(label, DEFAULT_COLORS[k % len(DEFAULT_COLORS)])
-            if phases is not None
-            else DEFAULT_COLORS[k % len(DEFAULT_COLORS)]
-        )
-        ax.text(
-            t_mid, y_label, label,
-            ha="center", va="bottom", fontsize=9,
-            color=color, fontweight="bold",
-        )
-
-    # ── Formatting ────────────────────────────────────────────────────────────
-    ax.set_xlim(0, T - 1)
-    ax.set_ylim(y_min - y_pad, y_max + y_pad * 4)
-    ax.set_xlabel("Timestep", fontsize=11)
-    ax.set_ylabel("GMT", fontsize=11)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    handles, labels = ax.get_legend_handles_labels()
-    seen = {}
-    for h, l in zip(handles, labels):
-        if l not in seen:
-            seen[l] = h
-    ax.legend(seen.values(), seen.keys(), frameon=False, fontsize=9, loc="upper left")
-
-    ax.set_title(title or "GMT Timeseries — Phase Splits", pad=8, fontsize=12)
-    fig.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return fig
-
-
-def plot_error_metrics_bar(
-    scenario_data: np.ndarray,
-    y_pred_ensemble: np.ndarray,
-    baseline_emulations: dict[str, np.ndarray] | None = None,
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-    metrics: list[str] = ("mae", "rmse", "max_ae"),
-    region_names: list[str] | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> dict:
-    """
-    Plot per-region error metrics as bar charts comparing the emulator
-    against one or more baseline emulation methods.
-
-    Parameters
-    ----------
-    scenario_data        : (n_members, T, n_regions) — ground truth
-    y_pred_ensemble      : (n_members, T, n_regions) — emulator output
-    baseline_emulations  : dict of name → (n_members, T, n_regions)
-    yearly_average       : aggregate months → annual means
-    month_selection      : restrict to a single calendar month (1–12)
-    detrend              : remove Gaussian-smoothed trend
-    detrend_tau          : smoothing sigma for detrending
-    deseasonalise        : subtract mean seasonal cycle
-    metrics              : which metrics to plot — any of
-                           'mae', 'rmse', 'max_ae', 'mse', 'nmae', 'nmse'
-    region_names         : list of region label strings
-    save_path            : path to save figure
-    dpi                  : resolution for saved figure
-
-    Returns
-    -------
-    dict mapping method name → {metric → np.ndarray of shape (n_regions,)}
-    """
-
-    for m in metrics:
-        if m not in ERROR_METRIC_REGISTRY:
-            raise ValueError(f"Unknown metric '{m}'. Choose from {list(ERROR_METRIC_REGISTRY)}")
-
-    # ── Preprocess ────────────────────────────────────────────────────────────
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    baselines_p = {}
-    if baseline_emulations:
-        for name, data in baseline_emulations.items():
-            baselines_p[name] = preprocess(data, **preprocess_kwargs)
-
-    n_regions = obs_p.shape[2]
-    labels    = region_names if region_names is not None else [str(i) for i in range(n_regions)]
-
-    # ── Compute scores per method per metric per region ───────────────────────
-    all_methods = {"Emulator": pred_p, **baselines_p}
-    results     = {}
-
-    for method_name, pred in all_methods.items():
-        results[method_name] = {}
-        for metric_key in metrics:
-            metric_label, score_fn = ERROR_METRIC_REGISTRY[metric_key]
-            results[method_name][metric_key] = np.array([
-                score_fn(obs_p[:, :, j], pred[:, :, j])
-                for j in range(n_regions)
-            ])
-
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    n_metrics = len(metrics)
-    fig, axes = plt.subplots(
-        n_metrics, 1,
-        figsize=(max(12, n_regions * 0.4), 4 * n_metrics),
-        sharex=True,
-    )
-    if n_metrics == 1:
-        axes = [axes]
-
-    method_colors = plt.get_cmap("tab10").colors
-    x      = np.arange(n_regions)
-    n_meth = len(all_methods)
-    width  = 0.8 / n_meth
-
-    for ax, metric_key in zip(axes, metrics):
-        metric_label, _ = ERROR_METRIC_REGISTRY[metric_key]
-
-        for k, (method_name, method_results) in enumerate(results.items()):
-            offset = (k - n_meth / 2 + 0.5) * width
-            scores = method_results[metric_key]
-            ax.bar(
-                x + offset, scores,
-                width=width * 0.9,
-                color=method_colors[k % len(method_colors)],
-                alpha=0.85,
-                label=method_name,
-            )
-
-        ax.set_ylabel(metric_label, fontsize=10)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=90, fontsize=7)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(axis="y", linewidth=0.5, alpha=0.5, linestyle="--")
-
-    axes[0].legend(frameon=False, fontsize=9, loc="upper right")
-
-    parts = []
-    if yearly_average:               parts.append("Yearly Avg")
-    if month_selection is not None:  parts.append(f"Month {month_selection}")
-    if deseasonalise:                parts.append("Deseasonalised")
-    if detrend:                      parts.append(f"Detrended (τ={detrend_tau})")
-    mode_str = " | ".join(parts) if parts else "Monthly"
-
-    fig.suptitle(
-        f"Per-Region Error Metrics [{mode_str}]",
-        fontsize=13, y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return results
-
-
-def plot_random_timeseries(
-    scenario_data: np.ndarray,
-    y_pred_ensemble: np.ndarray,
-    n_rows: int = 10,
-    figsize: tuple = (14, 22),
-    save_path: str = None,
-    dpi: int = 300,
-    seed: int = None,
-) -> plt.Figure:
-    """
-    Plot n_rows randomly sampled (ensemble, region) pairs side-by-side:
-    true timeseries on the left, predicted on the right.
-
-    Parameters
-    ----------
-    scenario_data   : (n_ensembles, n_timesteps, n_regions)
-    y_pred_ensemble : (n_ensembles, n_timesteps, n_regions)  — same shape
-    n_rows          : number of random pairs to plot (default 10)
-    figsize         : figure size tuple
-    save_path       : file path to save the figure (None to skip saving)
-    dpi             : resolution for saved figure
-    seed            : optional random seed for reproducibility
-
-    Returns
-    -------
-    fig : matplotlib Figure
-    """
-    assert scenario_data.shape == y_pred_ensemble.shape, (
-        f"Shape mismatch: scenario_data {scenario_data.shape} vs "
-        f"y_pred_ensemble {y_pred_ensemble.shape}"
-    )
-
-    n_ensembles, n_timesteps, n_regions = scenario_data.shape
-
-    if seed is not None:
-        random.seed(seed)
-
-    total = n_ensembles * n_regions
-    n_rows = min(n_rows, total)  # can't sample more than available pairs
-    indices = random.sample(range(total), n_rows)
-
-    fig, axes = plt.subplots(n_rows, 2, figsize=figsize)
-    if n_rows == 1:
-        axes = axes[np.newaxis, :]  # ensure 2-D indexing works for single row
-
-    for row, idx in enumerate(indices):
-        i = idx // n_regions   # ensemble index
-        j = idx  % n_regions   # region index
-
-        true_ts = scenario_data[i, :, j]
-        pred_ts = y_pred_ensemble[i, :, j]
-
-        # --- Left: True ---
-        ax_true = axes[row, 0]
-        ax_true.plot(true_ts, color="steelblue", linewidth=0.8)
-        ax_true.set_ylabel(f"e={i}, r={j}", fontsize=8, rotation=0, labelpad=40)
-        ax_true.spines["top"].set_visible(False)
-        ax_true.spines["right"].set_visible(False)
-        if row == 0:
-            ax_true.set_title("True", fontsize=11, fontweight="bold")
-
-        # --- Right: Predicted ---
-        ax_pred = axes[row, 1]
-        ax_pred.plot(pred_ts, color="tomato", linewidth=0.8)
-        ax_pred.spines["top"].set_visible(False)
-        ax_pred.spines["right"].set_visible(False)
-        if row == 0:
-            ax_pred.set_title("Predicted", fontsize=11, fontweight="bold")
-
-        # Shared y-axis range per row for fair comparison
-        y_min = min(true_ts.min(), pred_ts.min())
-        y_max = max(true_ts.max(), pred_ts.max())
-        pad   = (y_max - y_min) * 0.05 or 0.1  # avoid zero pad for flat series
-        ax_true.set_ylim(y_min - pad, y_max + pad)
-        ax_pred.set_ylim(y_min - pad, y_max + pad)
-
-        # Hide x tick labels except on the bottom row
-        if row < n_rows - 1:
-            ax_true.set_xticklabels([])
-            ax_pred.set_xticklabels([])
-
-    fig.suptitle(
-        f"True vs Predicted — {n_rows} Random Timeseries "
-        f"({n_ensembles} ensembles, {n_timesteps} timesteps, {n_regions} regions)",
-        fontsize=13,
-        y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    return fig
-
-# ── Ranking ────────────────────────────────────────────────────────────────────
-
-def rank_regions(
-    metric_scores: dict[int, float],
-    n_examples: int = 5,
-) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    """
-    Split region scores into the *n_examples* best and worst.
-
-    Parameters
-    ----------
-    metric_scores : dict mapping region index → score (lower = better)
-    n_examples    : how many regions to return at each extreme
-
-    Returns
-    -------
-    best_pairs  : list of (region_idx, score), ascending by score
-    worst_pairs : list of (region_idx, score), descending by score
-    """
-    sorted_pairs = sorted(metric_scores.items(), key=lambda x: x[1])
-    best_pairs  = sorted_pairs[:n_examples]
-    worst_pairs = sorted_pairs[-n_examples:][::-1]
-    return best_pairs, worst_pairs
-
-
-# ── Single-row plotting helper ────────────────────────────────────────────────
-
-def _plot_row(
-    axes_row: np.ndarray,
-    region_idx: int,
-    score: float,
-    true_ts: np.ndarray,
-    pred_ts: np.ndarray,
-    metric: str,
-    label: str,
-    is_first_row: bool,
-    is_last_row: bool,
-) -> None:
-    """
-    Fill one pair of axes (simulations | emulations) for a single region.
-
-    Parameters
-    ----------
-    axes_row    : array of two Axes objects
-    region_idx  : region index (used in ylabel)
-    score       : metric value for this region
-    true_ts     : (n_members, T) — ground-truth ensemble
-    pred_ts     : (n_members, T) — predicted ensemble
-    metric      : metric key (for ylabel label)
-    label       : annotation string, e.g. "Best #1"
-    is_first_row: whether to draw column titles
-    is_last_row : whether to show x-tick labels
-    """
-    y_min = min(true_ts.min(), pred_ts.min())
-    y_max = max(true_ts.max(), pred_ts.max())
-    pad   = (y_max - y_min) * 0.05
-
-    panels = [
-        (true_ts, "steelblue", "Simulations"),
-        (pred_ts, "tomato",    "Emulations"),
-    ]
-
-    for col, (ens, color, name) in enumerate(panels):
-        ax = axes_row[col]
-        for member in ens:
-            ax.plot(member, color=color, linewidth=0.4, alpha=0.2)
-        ax.plot(np.median(ens, axis=0), color=color, linewidth=1.5, label="Median")
-        ax.set_ylim(y_min - pad, y_max + pad)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.set_ylabel(
-            f"r={region_idx}\n{metric}={score:.4f}",
-            fontsize=8,
-            rotation=0,
-            labelpad=55,
-        )
-        if is_first_row:
-            ax.set_title(name, fontsize=11, fontweight="bold")
-        if not is_last_row:
-            ax.set_xticklabels([])
-
-    # Side annotation
-    axes_row[1].annotate(
-        label,
-        xy=(1.02, 0.5),
-        xycoords="axes fraction",
-        fontsize=9,
-        color="grey",
-        va="center",
-        rotation=270,
-    )
-
-
-# ── Main plot function ────────────────────────────────────────────────────────
-
-def plot_metric_extremes(
-    y_pred_ensemble: np.ndarray,
-    scenario_data: np.ndarray,
-    n_examples: int = 5,
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    metric: str = "crps",
-    save_path: str | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-) -> dict[int, float]:
-    """
-    Preprocess ensembles, compute a metric for every region, then plot the
-    *n_examples* best and worst regions side-by-side.
-
-    Parameters
-    ----------
-    y_pred_ensemble : (n_members, T, n_regions) — emulated ensemble
-    scenario_data   : (n_members, T, n_regions) — ground-truth ensemble
-    n_examples      : number of best / worst regions to display
-    yearly_average  : aggregate months → annual means before scoring
-    month_selection : restrict to a single calendar month (1–12)
-    metric          : one of 'crps', 'mean', 'sigma', 'psd'
-    save_path       : if given, save figure to this path (300 dpi)
-    detrend         : remove Gaussian-smoothed trend before scoring
-    detrend_tau     : smoothing sigma for detrending (timesteps)
-    deseasonalise   : subtract mean seasonal cycle before scoring
-
-    Returns
-    -------
-    dict mapping region index → metric score
-    """
-    # 1. Preprocess
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    # 2. Score every region
-    metric_scores = compute_metric_all_regions(obs_p, pred_p, metric)
-
-    # 3. Rank
-    best_pairs, worst_pairs = rank_regions(metric_scores, n_examples)
-
-    # 4. Build figure
-    n_rows = n_examples * 2
-    fig, axes = plt.subplots(n_rows, 2, figsize=(14, n_examples * 4 + 2))
-
-    for k, (region_idx, score) in enumerate(best_pairs):
-        _plot_row(
-            axes_row=axes[k],
-            region_idx=region_idx,
-            score=score,
-            true_ts=obs_p[:, :, region_idx],
-            pred_ts=pred_p[:, :, region_idx],
-            metric=metric,
-            label=f"Best #{k + 1}",
-            is_first_row=(k == 0),
-            is_last_row=(k == n_rows - 1),
-        )
-
-    # Divider between best and worst
-    fig.add_artist(
-        mlines.Line2D(
-            [0.05, 0.95],
-            [1 - (n_examples / n_rows) - 0.01] * 2,
-            transform=fig.transFigure,
-            color="grey",
-            linewidth=1,
-            linestyle="--",
-        )
-    )
-
-    for k, (region_idx, score) in enumerate(worst_pairs):
-        row = n_examples + k
-        _plot_row(
-            axes_row=axes[row],
-            region_idx=region_idx,
-            score=score,
-            true_ts=obs_p[:, :, region_idx],
-            pred_ts=pred_p[:, :, region_idx],
-            metric=metric,
-            label=f"Worst #{k + 1}",
-            is_first_row=False,
-            is_last_row=(row == n_rows - 1),
-        )
-
-    # 5. Title
-    if yearly_average:
-        mode_str = "Yearly Average"
-    elif month_selection is not None:
-        mode_str = f"Month {month_selection} Only"
-    else:
-        mode_str = "Monthly"
-
-    fig.suptitle(
-        f"{METRIC_LABELS[metric]} Extremes [{mode_str}]"
-        f" — {n_examples} Best & {n_examples} Worst Regions",
-        fontsize=13,
-        y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-
- 
-    return metric_scores
-
-def plot_spatial_correlations(
-    y_pred_ensemble: np.ndarray,
-    scenario_data: np.ndarray,
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-    region_names: list[str] | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> dict:
-    """
-    Preprocess ensembles, compute spatial correlation matrices for simulations
-    and emulations, and plot them side-by-side with their difference.
-
-    Parameters
-    ----------
-    y_pred_ensemble : (n_members, T, n_regions) — emulated ensemble
-    scenario_data   : (n_members, T, n_regions) — ground-truth ensemble
-    yearly_average  : aggregate months → annual means before scoring
-    month_selection : restrict to a single calendar month (1–12)
-    detrend         : remove Gaussian-smoothed trend before scoring
-    detrend_tau     : smoothing sigma for detrending (timesteps)
-    deseasonalise   : subtract mean seasonal cycle before scoring
-    region_names    : list of M region label strings (optional)
-    save_path       : if given, save figure to this path
-    dpi             : resolution for saved figure
-
-    Returns
-    -------
-    dict with keys 'sim_corr', 'emu_corr', 'diff', 'mae', 'rmse'
-    """
-    from .metrics import spatial_correlation_scores
-    from .transforms import preprocess
-
-    # 1. Preprocess
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    # 2. Compute correlation matrices
-    results  = spatial_correlation_scores(obs_p, pred_p)
-    sim_corr = results["sim_corr"]
-    emu_corr = results["emu_corr"]
-    diff     = results["diff"]
-    mae      = results["mae"]
-    rmse     = results["rmse"]
-
-    M      = sim_corr.shape[0]
-    labels = region_names if region_names is not None else [str(i) for i in range(M)]
-    tick_fontsize = max(4, min(8, 80 // M))   # scale tick labels to number of regions
-
-    # 3. Plot
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    diff_abs = max(np.abs(diff).max(), 1e-9)   # avoid zero-range colormap
-
-    panels = [
-        (sim_corr, "Simulation Correlations", "RdBu_r", -1,        1       ),
-        (emu_corr, "Emulation Correlations",  "RdBu_r", -1,        1       ),
-        (diff,     "Difference (Emu − Sim)",  "PiYG",   -diff_abs, diff_abs),
-    ]
-
-    for ax, (matrix, title, cmap, vmin, vmax) in zip(axes, panels):
-        im = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(title, pad=8)
-        ax.set_xticks(range(M))
-        ax.set_yticks(range(M))
-        ax.set_xticklabels(labels, rotation=90, fontsize=tick_fontsize)
-        ax.set_yticklabels(labels, fontsize=tick_fontsize)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    # 4. Mode string for title
-    parts = []
-    if yearly_average:                parts.append("Yearly Avg")
-    if month_selection is not None:   parts.append(f"Month {month_selection}")
-    if deseasonalise:                 parts.append("Deseasonalised")
-    if detrend:                       parts.append(f"Detrended (τ={detrend_tau})")
-    mode_str = " | ".join(parts) if parts else "Monthly"
-
-    fig.suptitle(
-        f"Spatial Correlations [{mode_str}]  —  MAE: {mae:.4f}  |  RMSE: {rmse:.4f}",
-        fontsize=13,
-        y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return results
-
-def _plot_qq_row(
-    axes_row: np.ndarray,
-    region_idx: int,
-    score: float,
-    obs_q: np.ndarray,
-    pred_q: np.ndarray,
-    quantiles: np.ndarray,
-    metric: str,
-    label: str,
-    is_first_row: bool,
-    is_last_row: bool,
-) -> None:
-    """
-    Fill one pair of axes for a single region:
-      left  — QQ scatter (sim quantiles vs emu quantiles)
-      right — quantile values vs quantile level for sim and emu
-    """
-    ax_qq   = axes_row[0]
-    ax_dist = axes_row[1]
-
-    # ── Left: QQ scatter ──────────────────────────────────────────────────────
-    q_min = min(obs_q.min(), pred_q.min())
-    q_max = max(obs_q.max(), pred_q.max())
-    pad   = (q_max - q_min) * 0.05
-
-    # 1:1 reference line
-    ax_qq.plot(
-        [q_min - pad, q_max + pad],
-        [q_min - pad, q_max + pad],
-        color="grey", linewidth=0.8, linestyle="--", zorder=1, label="1:1"
-    )
-    
-    sc = ax_qq.scatter(
-        obs_q, pred_q,
-        c=quantiles, cmap="plasma",
-        s=12, zorder=2, linewidths=0
-    )
-    if is_first_row:
-        ax_qq.set_title("QQ Plot (Sim vs Emu)", fontsize=11)
-
-    ax_qq.set_xlim(q_min - pad, q_max + pad)
-    ax_qq.set_ylim(q_min - pad, q_max + pad)
-    ax_qq.set_xlabel("Simulated quantile", fontsize=10)
-    ax_qq.set_ylabel(
-        f"{label}\n{QQ_METRIC_LABELS.get(metric, metric)}={score:.4f}",
-        fontsize=10, rotation=90, labelpad=15,
-    )
-    ax_qq.set_aspect("equal", adjustable="box")
-    ax_qq.spines["top"].set_visible(False)
-    ax_qq.spines["right"].set_visible(False)
-
-    # ── Right: quantile curves ────────────────────────────────────────────────
-    ax_dist.plot(quantiles, obs_q,  color="steelblue", linewidth=1.5, label="Simulations")
-    ax_dist.plot(quantiles, pred_q, color="tomato",    linewidth=1.5, label="Emulations",  linestyle="--")
-    ax_dist.fill_between(quantiles, obs_q, pred_q, alpha=0.15, color="grey", label="Gap")
-
-    if is_first_row:
-        ax_dist.set_title("Quantile Curves", fontsize=11)
-        ax_dist.legend(frameon=False, fontsize=8)
-
-    ax_dist.set_xlabel("Quantile level", fontsize=10)
-    ax_dist.spines["top"].set_visible(False)
-    ax_dist.spines["right"].set_visible(False)
-
-    if not is_last_row:
-        ax_qq.set_xticklabels([])
-        ax_dist.set_xticklabels([])
-
-    # Side annotation
-    axes_row[1].annotate(
-        label,
-        xy=(1.02, 0.5), xycoords="axes fraction",
-        fontsize=10, color="grey", va="center", rotation=270,
-    )
-
-
-def plot_qq_extremes(
-    y_pred_ensemble: np.ndarray,
-    scenario_data: np.ndarray,
-    n_examples: int = 5,
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-    metric: str = "mae",
-    n_quantiles: int = 99,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> dict:
-    """
-    Preprocess ensembles, score every region by a QQ metric, then plot the
-    n_examples best and worst regions with QQ scatter and quantile curves.
-
-    Parameters
-    ----------
-    y_pred_ensemble : (n_members, T, n_regions)
-    scenario_data   : (n_members, T, n_regions)
-    n_examples      : number of best / worst regions to display
-    yearly_average  : aggregate months → annual means
-    month_selection : restrict to a single calendar month (1–12)
-    detrend         : remove Gaussian-smoothed trend
-    detrend_tau     : smoothing sigma for detrending
-    deseasonalise   : subtract mean seasonal cycle
-    metric          : one of 'mae', 'nmae', 'max_ae', 'mse', 'nmse', 'ks', 'tail_mae'
-    n_quantiles     : number of evenly spaced quantile levels (default 99)
-    save_path       : path to save figure
-    dpi             : resolution for saved figure
-
-    Returns
-    -------
-    dict with keys 'scores', 'obs_qq', 'pred_qq', 'quantiles'
-    """
-
-    # 1. Preprocess
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    # 2. Quantile grid + scores
-    quantiles = np.linspace(0.01, 0.99, n_quantiles)
-    scores, obs_qq, pred_qq = compute_qq_scores_all_regions(obs_p, pred_p, metric, quantiles)
-
-    # 3. Rank
-    best_pairs, worst_pairs = rank_regions(scores, n_examples)
-
-    # 4. Build figure
-    n_rows = n_examples * 2
-    fig, axes = plt.subplots(n_rows, 2, figsize=(14, n_examples * 5 + 2))
-
-    # Create a shared colorbar axis at the top right
-    fig.subplots_adjust(right=0.88)
-    cbar_ax = fig.add_axes([0.90, 0.92, 0.08, 0.015])  # [left, bottom, width, height]
-
-    # Dummy scatter just for the colorbar
-    sm = plt.cm.ScalarMappable(cmap="plasma", norm=plt.Normalize(vmin=quantiles.min(), vmax=quantiles.max()))
-    sm.set_array([])
-    fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="Quantile level")
-
-    for k, (region_idx, score) in enumerate(best_pairs):
-        _plot_qq_row(
-            axes_row=axes[k],
-            region_idx=region_idx,
-            score=score,
-            obs_q=obs_qq[region_idx],
-            pred_q=pred_qq[region_idx],
-            quantiles=quantiles,
-            metric=metric,
-            label=f"Best #{k + 1}",
-            is_first_row=(k == 0),
-            is_last_row=(k == n_rows - 1),
-        )
-
-    # Divider
-    fig.add_artist(
-        mlines.Line2D(
-            [0.05, 0.95],
-            [1 - (n_examples / n_rows) - 0.01] * 2,
-            transform=fig.transFigure,
-            color="grey", linewidth=1, linestyle="--",
-        )
-    )
-
-    for k, (region_idx, score) in enumerate(worst_pairs):
-        row = n_examples + k
-        _plot_qq_row(
-            axes_row=axes[row],
-            region_idx=region_idx,
-            score=score,
-            obs_q=obs_qq[region_idx],
-            pred_q=pred_qq[region_idx],
-            quantiles=quantiles,
-            metric=metric,
-            label=f"Worst #{k + 1}",
-            is_first_row=False,
-            is_last_row=(row == n_rows - 1),
-        )
-
-    # 5. Title
-    parts = []
-    if yearly_average:               parts.append("Yearly Avg")
-    if month_selection is not None:  parts.append(f"Month {month_selection}")
-    if deseasonalise:                parts.append("Deseasonalised")
-    if detrend:                      parts.append(f"Detrended (τ={detrend_tau})")
-    mode_str = " | ".join(parts) if parts else "Monthly"
-
-    fig.suptitle(
-        f"QQ Extremes [{mode_str}] — {QQ_METRIC_LABELS[metric]}"
-        f" — {n_examples} Best & {n_examples} Worst Regions",
-        fontsize=13, y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return {
-        "scores":    scores,
-        "obs_qq":    obs_qq,
-        "pred_qq":   pred_qq,
-        "quantiles": quantiles,
-    }
-
-
-def plot_qq_regions(
-    y_pred_ensemble: np.ndarray,
-    scenario_data: np.ndarray,
-    regions_to_plot: list[str],
-    region_names: list[str],
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-    metric: str = "mae",
-    n_quantiles: int = 99,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> dict:
-    """
-    Plot QQ curves for a specified list of regions.
-
-    Parameters
-    ----------
-    y_pred_ensemble : (n_members, T, n_regions)
-    scenario_data   : (n_members, T, n_regions)
-    regions_to_plot : list of region abbreviations e.g. ["EPO", "NAO", "SAM"]
-    region_names    : full ordered list of region names (sorted(ar6_regions.abbrevs))
-    """
-    # 1. Preprocess
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    # 2. Quantile grid + scores
-    quantiles = np.linspace(0.01, 0.99, n_quantiles)
-    scores, obs_qq, pred_qq = compute_qq_scores_all_regions(obs_p, pred_p, metric, quantiles)
-
-    # 3. Resolve region indices
-    region_indices = [region_names.index(r) for r in regions_to_plot]
-    n_regions_plot = len(region_indices)
-
-    # 4. Build figure
-    fig, axes = plt.subplots(n_regions_plot, 2, figsize=(9, n_regions_plot * 2.5))
-    if n_regions_plot == 1:
-        axes = axes[np.newaxis, :]
-
-    # colorbar
-    sm = plt.cm.ScalarMappable(
-        cmap="plasma",
-        norm=plt.Normalize(vmin=quantiles.min(), vmax=quantiles.max())
-    )
-    sm.set_array([])
-
-    for k, (region_abbrev, region_idx) in enumerate(zip(regions_to_plot, region_indices)):
-        score = scores[region_idx]
-        _plot_qq_row(
-            axes_row=axes[k],
-            region_idx=region_idx,
-            score=score,
-            obs_q=obs_qq[region_idx],
-            pred_q=pred_qq[region_idx],
-            quantiles=quantiles,
-            metric=metric,
-            label=region_abbrev,
-            is_first_row=(k == 0),
-            is_last_row=(k == n_regions_plot - 1),
-        )
-
-    # 5. Title
-    parts = []
-    if yearly_average:               parts.append("Yearly Avg")
-    if month_selection is not None:  parts.append(f"Month {month_selection}")
-    if deseasonalise:                parts.append("Deseasonalised")
-    if detrend:                      parts.append(f"Detrended (τ={detrend_tau})")
-    mode_str = " | ".join(parts) if parts else "Monthly"
-
-    fig.suptitle(
-        f"QQ Plot [{mode_str}]",
-        fontsize=13, y=1.01,
-    )
-    plt.tight_layout()
-   # fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="Quantile level")
-    
-    # then add colorbar above the plots
-    cbar_ax = fig.add_axes([0.15, -0.03, 0.3, 0.02])  # [left, bottom, width, height]
-    fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="Quantile level")
-    
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        
-    plt.show()
-
-    return {
-        "scores":    scores,
-        "obs_qq":    obs_qq,
-        "pred_qq":   pred_qq,
-        "quantiles": quantiles,
-    }
-
-
-def plot_region_ensemble_extremes(
-    scenario_data: np.ndarray,
-    y_pred_ensemble: np.ndarray,
-    baseline_emulations: dict[str, np.ndarray] | None = None,
-    n_examples: int = 5,
-    yearly_average: bool = False,
-    month_selection: int | None = None,
-    detrend: bool = False,
-    detrend_tau: float = 20,
-    deseasonalise: bool = False,
-    metric: str = "mae",
-    ranking_mode: str = "emulator",
-    region_names: list[str] | None = None,
-    save_path: str | None = None,
-    dpi: int = 300,
-) -> dict:
-    """
-    Plot the n best and n worst regions side by side, showing simulation,
-    emulation and baseline ensemble timeseries in the same panel, ranked
-    by a chosen error metric.
-
-    Parameters
-    ----------
-    scenario_data        : (n_members, T, n_regions) — ground truth
-    y_pred_ensemble      : (n_members, T, n_regions) — emulator output
-    baseline_emulations  : dict of name → (n_members, T, n_regions)
-    n_examples           : number of best / worst regions to show
-    yearly_average       : aggregate months → annual means
-    month_selection      : restrict to a single calendar month (1–12)
-    detrend              : remove Gaussian-smoothed trend
-    detrend_tau          : smoothing sigma for detrending
-    deseasonalise        : subtract mean seasonal cycle
-    metric               : error metric key from ERROR_METRIC_REGISTRY
-    ranking_mode         : how to rank regions, one of:
-        'emulator'   — rank by emulator vs simulation error
-        'baseline'   — rank by baseline vs simulation error
-                        (uses first baseline if multiple given)
-        'difference' — rank by |baseline_error - emulator_error|
-                        (how much better/worse emulator is vs baseline)
-    region_names         : list of region label strings
-    save_path            : path to save figure
-    dpi                  : resolution for saved figure
-
-    Returns
-    -------
-    dict with keys 'scores', 'best_pairs', 'worst_pairs'
-    """
-    if metric not in ERROR_METRIC_REGISTRY:
-        raise ValueError(f"Unknown metric '{metric}'. Choose from {list(ERROR_METRIC_REGISTRY)}")
-    if ranking_mode not in ("emulator", "baseline", "difference"):
-        raise ValueError("ranking_mode must be 'emulator', 'baseline', or 'difference'")
-    if ranking_mode in ("baseline", "difference") and not baseline_emulations:
-        raise ValueError(f"ranking_mode='{ranking_mode}' requires at least one baseline_emulation")
-
-    # ── Preprocess ────────────────────────────────────────────────────────────
-    preprocess_kwargs = dict(
-        apply_yearly_average=yearly_average,
-        month_selection=month_selection,
-        apply_deseasonalise=deseasonalise,
-        apply_detrend=detrend,
-        detrend_tau=detrend_tau,
-    )
-    obs_p  = preprocess(scenario_data,   **preprocess_kwargs)
-    pred_p = preprocess(y_pred_ensemble, **preprocess_kwargs)
-
-    baselines_p = {}
-    if baseline_emulations:
-        for name, data in baseline_emulations.items():
-            baselines_p[name] = preprocess(data, **preprocess_kwargs)
-
-    n_regions  = obs_p.shape[2]
-    labels     = region_names if region_names is not None else [str(i) for i in range(n_regions)]
-    _, score_fn = ERROR_METRIC_REGISTRY[metric]
-
-    # ── Compute scores ────────────────────────────────────────────────────────
-    emu_scores  = np.array([score_fn(obs_p[:, :, j], pred_p[:, :, j]) for j in range(n_regions)])
-
-    base_scores = {}
-    for name, base_p in baselines_p.items():
-        base_scores[name] = np.array([
-            score_fn(obs_p[:, :, j], base_p[:, :, j]) for j in range(n_regions)
-        ])
-
-    # ── Rank ──────────────────────────────────────────────────────────────────
-    if ranking_mode == "emulator":
-        rank_scores = emu_scores
-
-    elif ranking_mode == "baseline":
-        first_baseline = next(iter(base_scores.values()))
-        rank_scores    = first_baseline
-
-    elif ranking_mode == "difference":
-        first_baseline = next(iter(base_scores.values()))
-        # Positive = emulator is worse than baseline, negative = emulator is better
-        rank_scores = emu_scores - first_baseline
-
-    best_pairs, worst_pairs = rank_regions(
-        {j: float(rank_scores[j]) for j in range(n_regions)},
-        n_examples
-    )
-
-    # ── Colour scheme ─────────────────────────────────────────────────────────
-    METHOD_STYLES = {
-        "Simulation": ("steelblue", "-",  2.0),
-        "Emulator":   ("tomato",    "--", 1.8),
-    }
-    BASE_COLORS = plt.get_cmap("tab10").colors[2:]  # reserve first 2 for sim/emu
-
-    # ── Plot helper ───────────────────────────────────────────────────────────
-    def _plot_row(ax, region_idx, is_first_row, label):
-        true_ts = obs_p[:, :, region_idx]
-        pred_ts = pred_p[:, :, region_idx]
-
-        all_data = [true_ts, pred_ts] + [b[:, :, region_idx] for b in baselines_p.values()]
-        y_min    = min(d.min() for d in all_data)
-        y_max    = max(d.max() for d in all_data)
-        pad      = (y_max - y_min) * 0.05
-
-        # Simulations
-        color, ls, lw = METHOD_STYLES["Simulation"]
-        for member in true_ts:
-            ax.plot(member, color=color, linewidth=0.3, alpha=0.15)
-        ax.plot(
-            np.median(true_ts, axis=0), color=color,
-            linewidth=lw, linestyle=ls,
-            label="Simulation" if is_first_row else "_nolegend_"
-        )
-
-        # Emulator
-        color, ls, lw = METHOD_STYLES["Emulator"]
-        for member in pred_ts:
-            ax.plot(member, color=color, linewidth=0.3, alpha=0.15)
-        ax.plot(
-            np.median(pred_ts, axis=0), color=color,
-            linewidth=lw, linestyle=ls,
-            label="Emulator" if is_first_row else "_nolegend_"
-        )
-
-        # Baselines
-        for b_idx, (name, base_p) in enumerate(baselines_p.items()):
-            base_ts = base_p[:, :, region_idx]
-            bcolor  = BASE_COLORS[b_idx % len(BASE_COLORS)]
-            for member in base_ts:
-                ax.plot(member, color=bcolor, linewidth=0.3, alpha=0.15)
-            ax.plot(
-                np.median(base_ts, axis=0), color=bcolor,
-                linewidth=1.5, linestyle=":",
-                label=name if is_first_row else "_nolegend_"
-            )
-
-        # Score annotations
-        score_lines = [f"emu {metric}={emu_scores[region_idx]:.3f}"]
-        for name, bs in base_scores.items():
-            score_lines.append(f"{name} {metric}={bs[region_idx]:.3f}")
-        if ranking_mode == "difference":
-            first_bs = next(iter(base_scores.values()))
-            score_lines.append(f"Δ={rank_scores[region_idx]:.3f}")
-
-        ax.text(
-            0.02, 0.97,
-            "\n".join(score_lines),
-            transform=ax.transAxes,
-            fontsize=7, va="top", color="grey"
-        )
-
-        region_label = labels[region_idx]
-        ax.set_ylabel(f"{region_label}\n{label}", fontsize=8, rotation=0, labelpad=60)
-        ax.set_ylim(y_min - pad, y_max + pad)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    # ── Build figure ──────────────────────────────────────────────────────────
-    n_rows = n_examples * 2
-    fig, axes = plt.subplots(n_rows, 1, figsize=(14, n_examples * 3 + 2))
-    if n_rows == 1:
-        axes = [axes]
-
-    for k, (region_idx, score) in enumerate(best_pairs):
-        _plot_row(axes[k], region_idx, is_first_row=(k == 0), label=f"Best #{k+1}")
-        if k < n_rows - 1:
-            axes[k].set_xticklabels([])
-
-    # Divider
-    fig.add_artist(
-        mlines.Line2D(
-            [0.05, 0.95],
-            [1 - (n_examples / n_rows) - 0.01] * 2,
-            transform=fig.transFigure,
-            color="grey", linewidth=1, linestyle="--",
-        )
-    )
-
-    for k, (region_idx, score) in enumerate(worst_pairs):
-        row = n_examples + k
-        _plot_row(axes[row], region_idx, is_first_row=False, label=f"Worst #{k+1}")
-        if row < n_rows - 1:
-            axes[row].set_xticklabels([])
-
-    # ── Legend + title ────────────────────────────────────────────────────────
-    axes[0].legend(frameon=False, fontsize=9, loc="upper right")
-
-    ranking_labels = {
-        "emulator":   "Emulator vs Simulation",
-        "baseline":   f"Baseline vs Simulation",
-        "difference": "Δ(Baseline error − Emulator error)",
-    }
-    parts = []
-    if yearly_average:               parts.append("Yearly Avg")
-    if month_selection is not None:  parts.append(f"Month {month_selection}")
-    if deseasonalise:                parts.append("Deseasonalised")
-    if detrend:                      parts.append(f"Detrended (τ={detrend_tau})")
-    mode_str = " | ".join(parts) if parts else "Monthly"
-
-    metric_label, _ = ERROR_METRIC_REGISTRY[metric]
-    fig.suptitle(
-        f"Best & Worst Regions [{mode_str}]\n"
-        f"Ranked by {metric_label} — {ranking_labels[ranking_mode]}",
-        fontsize=12, y=1.01,
-    )
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-    plt.show()
-
-    return {
-        "scores":      rank_scores,
-        "emu_scores":  emu_scores,
-        "base_scores": base_scores,
-        "best_pairs":  best_pairs,
-        "worst_pairs": worst_pairs,
-    }
-
-
-
-def plot_psd_comparison(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    regions_to_plot: list[str] | None = None,
-    fs: float = 1.0,
-    nperseg: int = 256,
-) -> plt.Figure:
-    """
-    Plot PSD comparison between simulation and emulation for selected regions.
-    Shading shows 10-90th percentile spread across members.
-
-    Parameters
-    ----------
-    obs_data        : (n_members, T, n_regions)
-    pred_data       : (n_members, T, n_regions)
-    region_names    : list of region name strings, length n_regions
-    regions_to_plot : which regions to plot (default: first 6)
-    fs              : sampling frequency
-    nperseg         : Welch segment length
-    """
-    if regions_to_plot is None:
-        regions_to_plot = region_names[:6]
-
-    psd = compute_psd_scores(obs_data, pred_data, fs=fs, nperseg=nperseg)
-    freqs    = psd["freqs"]
-    obs_psd  = psd["obs_psd"]
-    pred_psd = psd["pred_psd"]
-
-    # convert to period in years, mask zero frequency
-    mask = freqs > 0
-    periods = 1 / (freqs[mask] * 12)
-
-    n_plots = len(regions_to_plot)
-    ncols = 3
-    nrows = int(np.ceil(n_plots / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    axes = np.array(axes).flatten()
-
-    for ax, region in zip(axes, regions_to_plot):
-        r = region_names.index(region)
-        for data_psd, label, color in [
-            (obs_psd,  "Simulation", "steelblue"),
-            (pred_psd, "Emulation",  "darkorange"),
-        ]:
-            median = np.median(data_psd[:, mask, r], axis=0)
-            low    = np.percentile(data_psd[:, mask, r], 10, axis=0)
-            high   = np.percentile(data_psd[:, mask, r], 90, axis=0)
-            ax.fill_between(periods, low, high, alpha=0.25, color=color)
-            ax.plot(periods, median, color=color, label=label)
-
-        # add reference period lines — inside region loop, outside data loop
-        for period, linelabel, lcolor in [
-            (3.0, "~ENSO (3yr)", "green"),
-            (1.0, "Annual",       "grey"),
-            (0.5, "Semi-annual",  "lightgrey"),
-        ]:
-            ax.axvline(period, color=lcolor, linestyle=":", linewidth=1, label=linelabel)
-
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Period (years)")
-        ax.set_ylabel("PSD")
-        ax.set_title(region)
-        ax.legend(fontsize=8)
-
-    for ax in axes[n_plots:]:
-        ax.set_visible(False)
-    plt.tight_layout()
-    return fig
-
-def plot_rank_histogram(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    regions_to_plot: list[str] | None = None,
-) -> plt.Figure:
-    if regions_to_plot is None:
-        regions_to_plot = region_names[:6]
-
-    n_pred  = pred_data.shape[0]
-    ranks   = compute_rank_histogram(obs_data, pred_data)  # (n_obs, T, n_regions)
-
-    n_plots = len(regions_to_plot)
-    ncols   = 3
-    nrows   = int(np.ceil(n_plots / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    axes = np.array(axes).flatten()
-
-    for ax, region in zip(axes, regions_to_plot):
-        r      = region_names.index(region)
-        r_ranks = ranks[:, :, r].flatten()  # (n_obs * T,)
-        ax.hist(r_ranks, bins=n_pred + 1, range=(-0.5, n_pred + 0.5),
-                density=True, color="steelblue", edgecolor="white")
-        ax.axhline(1 / (n_pred + 1), color="red", linestyle="--", label="Uniform (ideal)")
-        ax.set_title(region)
-        ax.set_xlabel("Rank")
-        ax.set_ylabel("Frequency")
-        ax.legend(fontsize=8)
-
-    for ax in axes[n_plots:]:
-        ax.set_visible(False)
-
-    plt.tight_layout()
-    return fig
-
-
-
-def plot_eof_comparison(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    n_eofs: int = 3,
-) -> plt.Figure:
-    """
-    Plot leading EOFs side by side for simulation and emulation,
-    with explained variance fractions in the title.
-
-    Parameters
-    ----------
-    obs_data     : (n_members, T, n_regions)
-    pred_data    : (n_members, T, n_regions)
-    region_names : list of region name strings
-    n_eofs       : number of EOFs to plot
-    """
-    eof = compute_eof_scores(obs_data, pred_data, n_eofs=n_eofs)
-
-    fig, axes = plt.subplots(n_eofs, 2, figsize=(14, 4 * n_eofs))
-    if n_eofs == 1:
-        axes = axes[np.newaxis, :]
-
-    for i in range(n_eofs):
-        for ax, eofs, var_ratio, label, color in zip(
-            axes[i],
-            [eof["obs_eofs"],  eof["pred_eofs"]],
-            [eof["obs_var_ratio"], eof["pred_var_ratio"]],
-            ["Simulation", "Emulation"],
-            ["steelblue",  "darkorange"],
-        ):
-            ax.bar(range(len(region_names)), eofs[i], color=color, alpha=0.7)
-            ax.set_xticks(range(len(region_names)))
-            ax.set_xticklabels(region_names, rotation=90, fontsize=6)
-            ax.axhline(0, color="black", linewidth=0.5)
-            ax.set_title(f"{label} EOF{i+1} ({var_ratio[i]*100:.1f}% variance explained)")
-
-    plt.tight_layout()
-    return fig
-
-
-    
-import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import cartopy.crs as ccrs
-from matplotlib.colors import TwoSlopeNorm
+from cartopy.util import add_cyclic_point
 import regionmask
 import xarray as xr
 
-def plot_eof_comparison_map(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    n_eofs: int = 3,
-    cmap: str = "RdBu_r",
-    projection=None,
+from .metrics import (
+    ErrorData,
+    RankingResult,
+    compute_psd_curves,
+    compute_temporal_correlation_curve,
+    DEFAULT_QQ_QUANTILES,
+    DEFAULT_TEMPORAL_CORR_N_LAGS,
+)
+
+__all__ = [
+    "plot_map_regional",
+    "plot_map_gridded",
+    "bar_plot_regional",
+    "plot_error_matrix_regional",
+    "plot_timeseries_regional",
+    "plot_timeseries_gridded",
+    "plot_qq_scatter",
+    "plot_temporal_correlation_curves",
+    "plot_psd_curves",
+    "plot_correlation_comparison",
+    "plot_crps_timeseries_gridded",
+    "resolve_selection",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared style
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Colourblind-safe palette (Paul Tol "bright"), shared by every function below.
+_PAPER_C = {
+    "sim":      "#4477AA",   # blue
+    "emulator": "#EE7733",   # orange
+    "sim_band": "#BBBBBB",   # light grey, sim-vs-sim envelope
+    "diag":     "#000000",   # black diagonal / zero line
+    "baseline": ["#009988", "#AA3377", "#CCBB44", "#66CCEE"],
+}
+_PAPER_ALPHA_MEMBERS = 0.08
+_PAPER_ALPHA_CI      = 0.20
+_PAPER_ALPHA_BAND    = 0.35
+_PAPER_LW_MEDIAN     = 1.6
+_PAPER_LW_MEMBER     = 0.4
+_PAPER_LW_BASELINE   = 1.4
+_PAPER_LW_MAIN       = 1.5
+_PAPER_LW_DIAG       = 0.8
+
+
+def _baseline_color(i: int) -> str:
+    return _PAPER_C["baseline"][i % len(_PAPER_C["baseline"])]
+
+
+def _style_axes(ax, fontsize_ax: int, grid_axis: str | None = "y"):
+    """The shared spine/tick/grid treatment used by every line panel."""
+    ax.tick_params(labelsize=fontsize_ax, pad=1.5)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(0.6)
+    ax.spines["bottom"].set_linewidth(0.6)
+    ax.tick_params(width=0.6)
+    if grid_axis:
+        ax.grid(axis=grid_axis, linewidth=0.35, alpha=0.45, linestyle=":")
+
+
+def _indicator_unit(error_data: ErrorData, indicator: str,
+                    override: dict[str, str] | None) -> str:
+    if override and indicator in override:
+        return override[indicator]
+    return error_data.indicator_units.get(indicator, "")
+
+
+def _colorbar_unit(error_data: ErrorData, indicator: str,
+                   override: dict[str, str] | None) -> str:
+    """Bracketed text on a map colourbar: an explicit unit, else the indicator name."""
+    if override and indicator in override:
+        return override[indicator]
+    return error_data.indicator_labels.get(indicator, indicator).split()[0].lower()
+
+
+def _add_bottom_colorbars(fig, axes, im_handles, col_labels, cbar_label_fontsize):
+    """One horizontal colorbar per column, placed below the bottom row."""
+    fig.canvas.draw()
+    fig_height = fig.get_size_inches()[1]
+    cbar_height_inches, cbar_gap_inches = 0.15, 0.15
+    cbar_height_fig = cbar_height_inches / fig_height
+    for col_idx, label in enumerate(col_labels):
+        ax_ref = axes[-1, col_idx] if axes.ndim == 2 else axes[col_idx]
+        pos = ax_ref.get_position()
+        gap_fig = cbar_gap_inches / fig_height
+        cbar_ax = fig.add_axes([pos.x0, pos.y0 - gap_fig - cbar_height_fig, pos.width, cbar_height_fig])
+        cb = fig.colorbar(im_handles[col_idx], cax=cbar_ax, orientation="horizontal")
+        cb.set_label(label, fontsize=cbar_label_fontsize)
+        cb.ax.tick_params(labelsize=cbar_label_fontsize - 1)
+        cb.outline.set_linewidth(0.5)
+    fig.subplots_adjust(top=1 - 0.3 / fig_height)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit selection for the ranking grids
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_selection(
+    error_data: ErrorData,
+    ranking: RankingResult,
+    selection=None,
+) -> list[tuple[int, str]]:
+    """
+    Turn a `selection` argument into the ordered list of units a ranking
+    grid should show, one per column.
+
+    Parameters
+    ----------
+    error_data : the `ErrorData` being plotted (supplies unit labels)
+    ranking    : `error_data.ranking[indicator]` for the row being drawn —
+                 selection is resolved per indicator, because rank 1 for one
+                 indicator is generally a different unit than rank 1 for
+                 another.
+    selection  : one of
+        None (default)
+            The classic three columns: best, median and worst unit by
+            `ranking`.
+        list of int
+            1-based ranks, so ``[1, 2, 3]`` shows the three best units and
+            ``[1, 5, 50]`` the 1st, 5th and 50th best. Ranks run 1 (best) to
+            ``ranking.n_units`` (worst).
+        list of str (regional) / list of str or (lat, lon) pairs (gridded)
+            Explicit units, e.g. ``["SOO", "MED", "WAF"]`` or
+            ``[(45.0, 10.0), "(45.00°, 10.00°)"]``. Shown in the order given,
+            no ranking applied — the column header still reports each unit's
+            rank so you can see where it falls.
+
+    Returns
+    -------
+    list of ``(unit_index, column_header, header_names_the_ranking)``
+        The third element is True when the header describes a position in
+        the ranking ("Best", "Rank 3") rather than a specific unit, so the
+        caller knows whether appending "(by <ranking source>)" makes sense.
+    """
+    if selection is None:
+        return [
+            (ranking.best, "Best", True),
+            (ranking.median, "Median", True),
+            (ranking.worst, "Worst", True),
+        ]
+    if isinstance(selection, (str, int, np.integer)):
+        selection = [selection]
+    if len(selection) == 0:
+        raise ValueError("selection must contain at least one unit")
+
+    out: list[tuple[int, str, bool]] = []
+    for item in selection:
+        if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            rank = int(item)
+            out.append((ranking.unit_at_rank(rank), f"Rank {rank}", True))
+        else:
+            idx = error_data.index_of_unit(item)
+            out.append((idx, error_data.label_for(idx), False))
+    return out
+
+
+def _apply_share_y(row_axes: list) -> None:
+    """Give every axis in a row the same y-limits (the union of theirs)."""
+    lims = [ax.get_ylim() for ax in row_axes]
+    lo = min(l[0] for l in lims)
+    hi = max(l[1] for l in lims)
+    for ax in row_axes:
+        ax.set_ylim(lo, hi)
+
+
+def _ranking_grid(
+    error_data: ErrorData,
+    *,
+    draw_cell,
+    selection,
+    share_y_per_row: bool,
+    row_ylabel,
+    xlabel: str,
+    legend_handles: list,
+    panel_width: float,
+    panel_height: float,
+    fontsize_title: int,
+    fontsize_ax: int,
+    fontsize_legend: int,
+    hspace: float,
+    wspace: float,
+    show_ranking_source: bool,
+    suptitle: str | None,
+    save_path: str | None,
+    dpi: int,
+    per_cell_setup=None,
 ) -> plt.Figure:
-    eof = compute_eof_scores(obs_data, pred_data, n_eofs=n_eofs)
+    """
+    The shared layout behind every best/median/worst-style figure: one row
+    per indicator, one column per selected unit.
 
-    if projection is None:
-        projection = ccrs.Robinson()
+    `draw_cell(ax, indicator, unit_idx)` draws a single panel; everything
+    else — column headers, per-panel titles with the unit label and score,
+    axis labels, the shared legend, `share_y_per_row` and `selection` — is
+    handled here so all the ranking plots behave identically.
+    """
+    indicators = error_data.indicators
+    n_rows = len(indicators)
+    unit_noun = "gridpoint" if error_data.is_gridded else "region"
+    per_row_selection = [
+        resolve_selection(error_data, error_data.ranking[ind], selection)
+        for ind in indicators
+    ]
+    n_cols = len(per_row_selection[0])
 
-    ar6 = regionmask.defined_regions.ar6.all
-    abbrevs = sorted(ar6.abbrevs)
-
-    # Enforce that your region_names = sorted(ar6.abbrevs)
-    if list(region_names) != abbrevs:
-        raise ValueError(
-            "region_names must be exactly sorted(ar6.abbrevs).\n"
-            f"Got: {region_names}\n"
-            f"Expected: {abbrevs}"
-        )
-
-    # map abbrev -> index in your data
-    abbrev_to_idx = {abbr: i for i, abbr in enumerate(region_names)}
-    # map abbrev -> AR6 region number (not loop index)
-    abbrev_to_number = {abbr: ar6[abbr].number for abbr in abbrevs}
-
-    # dummy grid
-    ds = xr.Dataset(
-        coords={
-            "lon": np.linspace(-179.5, 179.5, 720),
-            "lat": np.linspace(-89.5, 89.5, 360),
-        }
+    fig = plt.figure(figsize=(panel_width * n_cols, panel_height * n_rows))
+    gs = mgridspec.GridSpec(
+        n_rows, n_cols, figure=fig, hspace=hspace, wspace=wspace,
+        left=0.08, right=0.99, top=0.93 if suptitle else 0.96, bottom=0.13,
     )
+
+    for row_idx, indicator in enumerate(indicators):
+        ranking = error_data.ranking[indicator]
+        short = error_data.short_label(indicator)
+        row_axes = []
+        for col_idx, (uidx, header, header_is_rank) in enumerate(per_row_selection[row_idx]):
+            ax = fig.add_subplot(gs[row_idx, col_idx])
+            row_axes.append(ax)
+
+            draw_cell(ax, indicator, uidx)
+
+            _style_axes(ax, fontsize_ax)
+            if per_cell_setup is not None:
+                per_cell_setup(ax)
+
+            # With an explicit `selection` the column header no longer says
+            # where the unit falls in the ranking, so put its rank in the
+            # panel title instead.
+            score_txt = f"{error_data.metric_label}={ranking.scores[uidx]:.3f}"
+            if not header_is_rank:
+                score_txt = f"rank {ranking.rank_of(uidx)} \N{MIDDLE DOT} {score_txt}"
+            title = f"{short} \N{MIDDLE DOT} {error_data.label_for(uidx)}  ({score_txt})"
+            if row_idx == 0:
+                head = header
+                if header_is_rank:
+                    head = f"{header} {unit_noun}"
+                    if show_ranking_source:
+                        head += f" (by {ranking.ranking_label})"
+                title = f"{head}\n{title}"
+            ax.set_title(title, fontsize=fontsize_title, pad=3)
+
+            if col_idx == 0:
+                ax.set_ylabel(row_ylabel(indicator), fontsize=fontsize_ax)
+            if row_idx == n_rows - 1:
+                ax.set_xlabel(xlabel, fontsize=fontsize_ax)
+
+        if share_y_per_row:
+            _apply_share_y(row_axes)
+
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles, ncol=len(legend_handles), loc="lower center",
+            bbox_to_anchor=(0.5, -0.01), fontsize=fontsize_legend, frameon=False,
+            handlelength=1.6, columnspacing=0.8, handletextpad=0.4,
+        )
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=fontsize_title + 1, y=1.0)
+    plt.subplots_adjust(bottom=0.13)
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Map plots
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plot_map_core(
+    error_data: ErrorData,
+    draw,
+    *,
+    show_difference: bool,
+    cmap_emulator: str,
+    cmap_baseline: str,
+    cmap_difference: str,
+    projection,
+    figsize_per_panel: tuple[float, float],
+    cbar_label_fontsize: int,
+    units: dict[str, str] | None,
+    default_suptitle: str,
+    suptitle: str | None,
+    save_path: str | None,
+    dpi: int,
+):
+    """Shared body of `plot_map_regional` / `plot_map_gridded`.
+
+    `draw(ax, values, cmap, norm)` renders one panel's per-unit values.
+    """
+    indicators = error_data.indicators
+    comparisons = error_data.comparisons
+    n_rows, n_cols = len(comparisons), len(indicators)
+    fw, fh = figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(fw, fh), squeeze=False,
+        subplot_kw={"projection": projection}, gridspec_kw={"hspace": 0.12, "wspace": 0.04},
+    )
+
+    row_cmaps = [cmap_emulator] + [cmap_baseline] * (n_rows - 1)
+    norms = {i: mcolors.Normalize(vmin=0, vmax=error_data.vmax[i]) for i in indicators}
+    im_handles = {}
+    for row_idx, label in enumerate(comparisons):
+        for col_idx, indicator in enumerate(indicators):
+            ax = axes[row_idx, col_idx]
+            im = draw(ax, error_data.scores[label][indicator], row_cmaps[row_idx], norms[indicator])
+            im_handles[col_idx] = im
+            if col_idx == 0:
+                ax.text(-0.02, 0.5, label, transform=ax.transAxes, ha="right", va="center",
+                        fontsize=9, fontweight="bold", rotation=90)
+            if row_idx == 0:
+                ax.set_title(error_data.indicator_labels[indicator], fontsize=10, pad=6)
+
+    col_labels = [
+        f"{error_data.metric_label}  [{_colorbar_unit(error_data, i, units)}]"
+        for i in indicators
+    ]
+    _add_bottom_colorbars(fig, axes, im_handles, col_labels, cbar_label_fontsize)
+    fig.suptitle(suptitle or default_suptitle, fontsize=12, y=1.01)
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    if not show_difference:
+        return fig
+    if error_data.diff is None:
+        raise ValueError(
+            "show_difference=True requires error_data.diff — build error_data "
+            "with at least one baseline in baseline_emulations."
+        )
+    diff_label = f"Emulator \N{MINUS SIGN} {error_data.diff_baseline}"
+    diff_norms = {
+        i: mcolors.Normalize(vmin=-error_data.diff_vmax[i], vmax=error_data.diff_vmax[i])
+        for i in indicators
+    }
+    diff_fig, diff_axes = plt.subplots(
+        1, n_cols, figsize=(fw, figsize_per_panel[1]), squeeze=False,
+        subplot_kw={"projection": projection}, gridspec_kw={"hspace": 0.12, "wspace": 0.04},
+    )
+    diff_axes = diff_axes[0]
+    diff_im_handles = {}
+    for col_idx, indicator in enumerate(indicators):
+        ax = diff_axes[col_idx]
+        im = draw(ax, error_data.diff[indicator], cmap_difference, diff_norms[indicator])
+        diff_im_handles[col_idx] = im
+        if col_idx == 0:
+            ax.text(-0.02, 0.5, diff_label, transform=ax.transAxes, ha="right", va="center",
+                    fontsize=9, fontweight="bold", rotation=90)
+        ax.set_title(error_data.indicator_labels[indicator], fontsize=10, pad=6)
+    diff_col_labels = [
+        f"\N{GREEK CAPITAL LETTER DELTA} {error_data.metric_label}  "
+        f"[{_colorbar_unit(error_data, i, units)}]"
+        for i in indicators
+    ]
+    _add_bottom_colorbars(diff_fig, diff_axes, diff_im_handles, diff_col_labels, cbar_label_fontsize)
+    if save_path:
+        base, ext = save_path.rsplit(".", 1) if "." in save_path else (save_path, "png")
+        diff_fig.savefig(f"{base}_difference.{ext}", dpi=dpi, bbox_inches="tight")
+    return fig, diff_fig
+
+
+def plot_map_regional(
+    error_data: ErrorData,
+    *,
+    show_difference: bool = False,
+    cmap_emulator: str = "YlOrRd",
+    cmap_baseline: str = "YlOrRd",
+    cmap_difference: str = "RdBu_r",
+    projection=None,
+    figsize_per_panel: tuple[float, float] = (7, 3.2),
+    cbar_label_fontsize: int = 9,
+    units: dict[str, str] | None = None,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure | tuple[plt.Figure, plt.Figure]:
+    """
+    Per-AR6-region scores plotted as a choropleth map: one column per
+    indicator, one row per comparison (Emulator, then each baseline).
+
+    Works with any `ErrorData`, whatever metric family it was built with —
+    the scores are already computed; this function only lays them out.
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` or
+        `metrics.build_error_data_intervariable_correlation*`. Its
+        `indicators` list decides how many columns are drawn and their
+        titles come from its `indicator_labels`.
+    show_difference : if True, additionally build and return a second figure
+        with the (Emulator − `error_data.diff_baseline`) difference maps.
+        Requires `error_data.diff`, i.e. at least one baseline was supplied
+        when building `error_data`.
+    cmap_emulator, cmap_baseline, cmap_difference : colormaps
+    projection : Cartopy CRS (default Robinson)
+    figsize_per_panel, cbar_label_fontsize : figure geometry
+    units : optional ``{"tas": "K", ...}`` to show physical units in the
+        colorbar label instead of the indicator name (useful e.g. for "crps").
+    suptitle, save_path, dpi : as usual
+
+    Returns
+    -------
+    matplotlib Figure, or (Figure, Figure) if show_difference=True
+    """
+    ar6 = regionmask.defined_regions.ar6.all
+    expected = sorted(ar6.abbrevs)
+    region_names = error_data.unit_labels
+    if region_names is None or list(region_names) != expected:
+        raise ValueError(
+            "error_data.unit_labels must equal sorted(ar6.abbrevs) to plot a "
+            f"regional map.\nGot:      {region_names}\nExpected: {expected}"
+        )
+    abbrev_to_idx = {a: i for i, a in enumerate(region_names)}
+    abbrev_to_number = {a: ar6[a].number for a in expected}
+
+    ds = xr.Dataset(coords={
+        "lon": np.linspace(-179.5, 179.5, 720),
+        "lat": np.linspace(-89.5, 89.5, 360),
+    })
     mask = ar6.mask(ds)
 
-    fig, axes = plt.subplots(
-        n_eofs, 2,
-        figsize=(16, 5 * n_eofs),
-        subplot_kw={"projection": projection},
+    def draw(ax, scores, cmap, norm):
+        region_values = xr.full_like(mask, np.nan, dtype=float)
+        for abbr in expected:
+            region_values = region_values.where(
+                mask != abbrev_to_number[abbr], float(scores[abbrev_to_idx[abbr]])
+            )
+        im = ax.pcolormesh(
+            ds.lon, ds.lat, region_values,
+            transform=ccrs.PlateCarree(), cmap=cmap, norm=norm, shading="auto",
+        )
+        ar6.plot(
+            ax=ax, add_label=False, add_coastlines=True, add_ocean=False, add_land=False,
+            line_kws={"color": "0.3", "linewidth": 0.4},
+        )
+        ax.set_global()
+        return im
+
+    return _plot_map_core(
+        error_data, draw,
+        show_difference=show_difference, cmap_emulator=cmap_emulator,
+        cmap_baseline=cmap_baseline, cmap_difference=cmap_difference,
+        projection=ccrs.Robinson() if projection is None else projection,
+        figsize_per_panel=figsize_per_panel, cbar_label_fontsize=cbar_label_fontsize,
+        units=units, default_suptitle=f"Per-Region {error_data.metric_label}",
+        suptitle=suptitle, save_path=save_path, dpi=dpi,
     )
-    if n_eofs == 1:
-        axes = np.array([axes])
-
-    last_im = None
-
-    for i in range(n_eofs):
-        for ax, eofs, var_ratio, title_prefix in zip(
-            axes[i],
-            [eof["obs_eofs"], eof["pred_eofs"]],
-            [eof["obs_var_ratio"], eof["pred_var_ratio"]],
-            ["Simulation", "Emulation"],
-        ):
-            vals = np.array([eofs[i, abbrev_to_idx[a]] for a in abbrevs], dtype=float)
-            vmax = np.nanmax(np.abs(vals))
-            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
-
-            # initialize with NaNs
-            region_values = xr.full_like(mask, np.nan, dtype=float)
-
-            # assign each region by its true AR6 number, not loop index
-            for abbr, val in zip(abbrevs, vals):
-                region_values = region_values.where(mask != abbrev_to_number[abbr], val)
-
-            last_im = ax.pcolormesh(
-                ds.lon,
-                ds.lat,
-                region_values,
-                transform=ccrs.PlateCarree(),
-                cmap=cmap,
-                norm=norm,
-                shading="auto",
-            )
-
-            ar6.plot(
-                ax=ax,
-                add_label=False,
-                add_coastlines=True,
-                add_ocean=False,
-                add_land=False,
-                line_kws={"color": "black", "linewidth": 0.35},
-            )
-            ax.set_title(f"{title_prefix} EOF{i+1} ({var_ratio[i]*100:.1f}% variance explained)")
-            ax.set_global()
-
-    plt.tight_layout(rect=[0, 0.05, 1, 1])  # bottom 12%; minimal top
-    
-    pos = axes[-1, 0].get_position()
-    
-    cbar_height = 0.02
-    cbar_width  = pos.width
-    cbar_bottom = 0.05
-    cbar_left   = pos.x0 + cbar_width/2
-    
-    cbar_ax = fig.add_axes([
-        cbar_left,
-        cbar_bottom,
-        cbar_width,
-        cbar_height,
-    ])
-    fig.colorbar(last_im, cax=cbar_ax, orientation="horizontal", label="EOF loading")
-    
-    return fig
 
 
+def plot_map_gridded(
+    error_data: ErrorData,
+    *,
+    show_difference: bool = False,
+    cmap_emulator: str = "YlOrRd",
+    cmap_baseline: str = "YlOrRd",
+    cmap_difference: str = "RdBu_r",
+    projection=None,
+    figsize_per_panel: tuple[float, float] = (7, 3.2),
+    cbar_label_fontsize: int = 9,
+    units: dict[str, str] | None = None,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure | tuple[plt.Figure, plt.Figure]:
+    """
+    Gridded analogue of `plot_map_regional`: per-gridpoint scores drawn on
+    the data's native (lat, lon) grid — no regionmask / AR6 choropleth. Also
+    renders the CRPS map (build `error_data` with ``metric="crps"``).
 
-def plot_teleconnection_comparison(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    index_regions: list[str],
-    target_regions: list[str] | None = None,
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_gridded` (or
+        `build_error_data_intervariable_correlation*` with `lat`/`lon` set)
+    (all other parameters: see `plot_map_regional`)
+
+    Returns
+    -------
+    matplotlib Figure, or (Figure, Figure) if show_difference=True
+    """
+    if error_data.lat is None:
+        raise ValueError(
+            "error_data.lat/lon must be set to plot a gridded map "
+            "(build it with build_error_data_gridded)."
+        )
+    ref_lat, ref_lon = error_data.lat, error_data.lon
+    n_lat, n_lon = error_data.n_lat, error_data.n_lon
+
+    def draw(ax, scores, cmap, norm):
+        grid_vals = np.asarray(scores).reshape(n_lat, n_lon)
+        data_cyclic, lon_cyclic = add_cyclic_point(grid_vals, coord=ref_lon)
+        im = ax.pcolormesh(
+            lon_cyclic, ref_lat, data_cyclic,
+            transform=ccrs.PlateCarree(), cmap=cmap, norm=norm, shading="auto",
+        )
+        ax.coastlines(color="0.3", linewidth=0.4)
+        ax.set_global()
+        return im
+
+    return _plot_map_core(
+        error_data, draw,
+        show_difference=show_difference, cmap_emulator=cmap_emulator,
+        cmap_baseline=cmap_baseline, cmap_difference=cmap_difference,
+        projection=ccrs.Robinson() if projection is None else projection,
+        figsize_per_panel=figsize_per_panel, cbar_label_fontsize=cbar_label_fontsize,
+        units=units, default_suptitle=f"Per-Gridpoint {error_data.metric_label}",
+        suptitle=suptitle, save_path=save_path, dpi=dpi,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bar chart (regional only — one bar per AR6 region)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bar_plot_regional(
+    error_data: ErrorData,
+    *,
+    show_difference: bool = False,
+    cmap_emulator: str = "YlOrRd",
+    cmap_baseline: str = "YlOrRd",
+    cmap_difference: str = "RdBu_r",
+    figsize_per_panel: tuple[float, float] = (7, 3.2),
+    label_fontsize: int = 9,
+    units: dict[str, str] | None = None,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
 ) -> plt.Figure:
     """
-    Compare instantaneous teleconnection patterns between simulation and emulation,
-    after removing the ensemble mean (forced response) to isolate internal variability.
+    Bar-chart equivalent of `plot_map_regional`: same `ErrorData`, one panel
+    per indicator, but instead of one row per comparison, *all* comparisons
+    (plus the Emulator-minus-baseline difference, if requested) are drawn as
+    a grouped bar chart — for each AR6 region the bars sit in a tight
+    cluster, and clusters are spaced along the x-axis.
 
-    obs_data, pred_data: (n_members, T, n_regions)
-    index_regions: driving regions (e.g. ["EPO", "EAO"])
-    target_regions: regions to correlate against (default: all)
+    Panels whose scores are identical across indicators are collapsed to a
+    single panel, so the intervariable-correlation `ErrorData` (which has
+    one score per *pair*, not per indicator) renders as one chart rather
+    than two identical ones.
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` or
+        `build_error_data_intervariable_correlation*`
+    show_difference : add one extra bar per region group with
+        (Emulator − `error_data.diff_baseline`). Requires `error_data.diff`.
+    cmap_emulator, cmap_baseline, cmap_difference : used to pick one flat
+        colour per bar *series* (not per bar value — the bar height already
+        encodes the value; colour only distinguishes the series).
+    figsize_per_panel : (width, height) of a single indicator panel. With 58
+        AR6 regions the default width is usually too narrow for readable
+        labels — consider e.g. ``(16, 4)``.
+    label_fontsize : sizes axis, tick and legend text.
+    units : optional ``{"tas": "K", ...}`` shown in the y-axis label.
+    suptitle, save_path, dpi : as usual
+
+    Returns
+    -------
+    matplotlib Figure (a single figure — every comparison and, if requested,
+    the difference are all bars within it)
     """
-    # remove ensemble mean to isolate internal variability
-    obs_anom  = obs_data  - obs_data.mean(axis=0, keepdims=True)
-    pred_anom = pred_data - pred_data.mean(axis=0, keepdims=True)
+    ar6 = regionmask.defined_regions.ar6.all
+    expected = sorted(ar6.abbrevs)
+    region_names = error_data.unit_labels
+    if region_names is None or list(region_names) != expected:
+        raise ValueError(
+            "error_data.unit_labels must equal sorted(ar6.abbrevs) to plot a "
+            f"regional bar chart.\nGot:      {region_names}\nExpected: {expected}"
+        )
+    abbrev_to_idx = {a: i for i, a in enumerate(region_names)}
+    x = np.arange(len(expected))
 
-    # pool across members
-    n_members, T, n_regions = obs_data.shape
-    obs_flat  = obs_anom.reshape(n_members * T, n_regions)
-    pred_flat = pred_anom.reshape(n_members * T, n_regions)
+    if show_difference and error_data.diff is None:
+        raise ValueError(
+            "show_difference=True requires error_data.diff — build error_data "
+            "with at least one baseline in baseline_emulations."
+        )
 
-    if target_regions is None:
-        target_regions = region_names
+    comparisons = list(error_data.comparisons)
+    n_baselines = len(comparisons) - 1
 
-    n_plots = len(index_regions)
-    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 4 * n_plots))
-    if n_plots == 1:
-        axes = [axes]
+    series_labels = list(comparisons)
+    series_colors = [plt.get_cmap(cmap_emulator)(0.95)]
+    if n_baselines == 1:
+        series_colors.append(plt.get_cmap(cmap_baseline)(0.35))
+    elif n_baselines > 1:
+        for frac in np.linspace(0.3, 0.6, n_baselines):
+            series_colors.append(plt.get_cmap(cmap_baseline)(frac))
+    diff_label = None
+    if show_difference:
+        diff_label = f"Emulator \N{MINUS SIGN} {error_data.diff_baseline}"
+        series_labels.append(diff_label)
+        series_colors.append(plt.get_cmap(cmap_difference)(0.15))
 
-    for ax, index_region in zip(axes, index_regions):
-        x = np.arange(len(target_regions))
-        idx = region_names.index(index_region)
+    n_series = len(series_labels)
+    bar_width = 0.75 / n_series
 
-        obs_corrs  = np.array([
-            np.corrcoef(obs_flat[:, idx], obs_flat[:, region_names.index(t)])[0, 1]
-            for t in target_regions
-            if t != index_region  # exclude self-correlation
-        ])
-        pred_corrs = np.array([
-            np.corrcoef(pred_flat[:, idx], pred_flat[:, region_names.index(t)])[0, 1]
-            for t in target_regions
-            if t != index_region
-        ])
+    # Collapse indicators that carry identical scores (e.g. an
+    # intervariable-correlation ErrorData) into a single panel.
+    indicators = list(error_data.indicators)
+    kept: list[str] = []
+    for ind in indicators:
+        dup = any(
+            all(np.allclose(error_data.scores[c][ind], error_data.scores[c][k])
+                for c in comparisons)
+            for k in kept
+        )
+        if not dup:
+            kept.append(ind)
+    show_titles = len(kept) > 1
 
-        target_regions_plot = [t for t in target_regions if t != index_region]
-        x = np.arange(len(target_regions_plot))
+    n_cols = len(kept)
+    fw, fh = figsize_per_panel[0] * n_cols, figsize_per_panel[1]
+    fig, axes = plt.subplots(1, n_cols, figsize=(fw, fh), squeeze=False,
+                             gridspec_kw={"wspace": 0.18})
+    axes = axes[0]
 
-        ax.bar(x - 0.2, obs_corrs,  0.4, label="Simulation", color="steelblue",  alpha=0.7)
-        ax.bar(x + 0.2, pred_corrs, 0.4, label="Emulation",  color="darkorange", alpha=0.7)
-        ax.axhline(0, color="black", linewidth=0.5)
+    tick_fontsize = max(label_fontsize - 4, 4)
+    legend_handles = []
+
+    for col_idx, indicator in enumerate(kept):
+        ax = axes[col_idx]
+        for k, label in enumerate(series_labels):
+            source = error_data.diff if label == diff_label else error_data.scores[label]
+            vals = np.array([source[indicator][abbrev_to_idx[a]] for a in expected], dtype=float)
+            offset = (k - n_series / 2 + 0.5) * bar_width
+            bars = ax.bar(x + offset, vals, width=bar_width * 0.95,
+                          color=series_colors[k], alpha=0.85, label=label)
+            if col_idx == 0:
+                legend_handles.append(bars)
+
+        if show_difference:
+            ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlim(-0.6, len(expected) - 0.4)
         ax.set_xticks(x)
-        ax.set_xticklabels(target_regions_plot, rotation=90, fontsize=6)
-        ax.set_title(f"Teleconnections from {index_region} (ensemble-mean removed)")
-        ax.set_ylabel("Correlation")
-        ax.legend(fontsize=8)
+        ax.set_xticklabels(expected, rotation=90, fontsize=tick_fontsize)
+        ax.tick_params(axis="y", labelsize=tick_fontsize)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", linewidth=0.5, alpha=0.5, linestyle="--")
+        if show_titles:
+            ax.set_title(error_data.indicator_labels[indicator], fontsize=10, pad=6)
+        unit_str = _indicator_unit(error_data, indicator, units)
+        ax.set_ylabel(
+            f"{error_data.metric_label}  [{unit_str}]" if unit_str else error_data.metric_label,
+            fontsize=label_fontsize,
+        )
 
-    plt.tight_layout()
+    fig.legend(legend_handles, series_labels, loc="upper center", ncol=n_series,
+               frameon=False, fontsize=label_fontsize, bbox_to_anchor=(0.5, 1.06))
+    fig.suptitle(suptitle or f"Per-Region {error_data.metric_label}", fontsize=12, y=1.14)
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
     return fig
-    
 
 
-def plot_lagged_correlations(
-    obs_data: np.ndarray,
-    pred_data: np.ndarray,
-    region_names: list[str],
-    index_region: str,
-    target_regions: list[str] | None = None,
-    max_lag: int = 24,
+# ─────────────────────────────────────────────────────────────────────────────
+# Error matrix — many models at once, regions as columns
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MATRIX_ROW_KEYS = ("model", "indicator", "comparison")
+
+
+def _resolve_matrix_inputs(error_data, models, indicators, comparisons):
+    """Normalise the input to a {model: ErrorData} dict and resolve the three row axes."""
+    if isinstance(error_data, ErrorData):
+        error_data = {"": error_data}
+    if not isinstance(error_data, dict) or not error_data:
+        raise TypeError(
+            "error_data must be an ErrorData or a non-empty {model_name: ErrorData} dict"
+        )
+    for name, ed in error_data.items():
+        if not isinstance(ed, ErrorData):
+            raise TypeError(f"error_data['{name}'] is {type(ed).__name__}, not an ErrorData")
+        if ed.unit_labels is None:
+            raise ValueError(
+                f"error_data['{name}'] has no unit_labels — plot_error_matrix_regional "
+                "needs regional ErrorData (a gridded one would have thousands of columns)."
+            )
+
+    model_names = list(error_data) if models is None else list(models)
+    unknown = [m for m in model_names if m not in error_data]
+    if unknown:
+        raise ValueError(f"models names unknown key(s) {unknown}; available: {list(error_data)}")
+
+    # Every ErrorData must describe the same regions, or the columns don't line up.
+    ref_name = model_names[0]
+    ref_units = list(error_data[ref_name].unit_labels)
+    for name in model_names[1:]:
+        if list(error_data[name].unit_labels) != ref_units:
+            raise ValueError(
+                f"error_data['{name}'] has different unit_labels than error_data['{ref_name}'] — "
+                "every ErrorData must cover the same regions, in the same order."
+            )
+
+    metrics = {error_data[m].metric_label for m in model_names}
+    if len(metrics) > 1:
+        raise ValueError(
+            f"every ErrorData must use the same metric; got {sorted(metrics)}. "
+            "Build one matrix per metric."
+        )
+
+    def _union(attr):
+        seen = []
+        for m in model_names:
+            for v in getattr(error_data[m], attr):
+                if v not in seen:
+                    seen.append(v)
+        return seen
+
+    ind_names = _union("indicators") if indicators is None else list(indicators)
+    cmp_names = _union("comparisons") if comparisons is None else list(comparisons)
+    return error_data, model_names, ind_names, cmp_names, ref_units
+
+
+def plot_error_matrix_regional(
+    error_data,
+    *,
+    row_order: tuple[str, str, str] = ("model", "indicator", "comparison"),
+    models: list[str] | None = None,
+    indicators: list[str] | None = None,
+    comparisons: list[str] | None = None,
+    regions: list[str] | None = None,
+    sort_regions=None,
+    normalise: str = "indicator",
+    cmap: str = "YlOrRd",
+    vmin=0.0,
+    vmax=None,
+    missing_color: str = "0.9",
+    show_values: bool = False,
+    value_fmt: str = "{:.2f}",
+    group_separators: bool = True,
+    figsize: tuple[float, float] | None = None,
+    fontsize_tick: int = 6,
+    fontsize_label: int = 9,
+    cbar_label_fontsize: int = 9,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
 ) -> plt.Figure:
-    # remove ensemble mean
-    obs_anom  = obs_data  - obs_data.mean(axis=0, keepdims=True)
-    pred_anom = pred_data - pred_data.mean(axis=0, keepdims=True)
-    n_members, T, n_regions = obs_data.shape
-    
-    if target_regions is None:
-        target_regions = region_names[:6]
+    """
+    Every model, indicator and experiment in one matrix: regions across the
+    columns, one row per (model, indicator, comparison) combination, and the
+    error value as colour.
 
-    idx  = region_names.index(index_region)
-    lags = np.arange(max_lag + 1)
+    This is the many-models counterpart to `plot_map_regional`. A map shows
+    one model at a time and spends its space on geography; this shows an
+    arbitrary number of models, indicators and comparisons side by side and
+    spends its space on the comparison itself, at the cost of the spatial
+    layout. Reach for it when the question is "which model/experiment is
+    worst, and in which regions?" rather than "where on Earth is the error?".
 
-    n_plots = len(target_regions)
-    ncols   = 3
-    nrows   = int(np.ceil(n_plots / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    axes = np.array(axes).flatten()
+    "Comparison" is what an `ErrorData` already carries — Emulator plus every
+    baseline you built it with, so `Simulations vs Simulations` and
+    `Pattern Scaling` become their own rows automatically.
 
-    for ax, target in zip(axes, target_regions):
-        t = region_names.index(target)
+    Parameters
+    ----------
+    error_data : ``{model_name: ErrorData}``, or a single `ErrorData`
+        One entry per model. Every entry must cover the same regions in the
+        same order and use the same metric — otherwise the columns don't line
+        up or the colours don't mean the same thing, and this raises. The
+        keys are free-form labels, so they can name anything that varies
+        between the runs: a model, a scenario, or both
+        (``"ACCESS-ESM1-5 ssp245"``). A bare `ErrorData` is accepted for the
+        single-model case and gets an unlabelled model axis.
 
-        obs_lc  = np.mean([
-            lagged_correlation(obs_anom[m, :, idx], obs_anom[m, :, t], max_lag)
-            for m in range(obs_anom.shape[0])
-        ], axis=0)
+        Build the dict by looping over whatever you are comparing::
 
-        pred_lc = np.mean([
-            lagged_correlation(pred_anom[m, :, idx], pred_anom[m, :, t], max_lag)
-            for m in range(pred_anom.shape[0])
-        ], axis=0)
+            error_data = {
+                model: build_error_data_regional(
+                    sim[model], emu[model], region_list, metric="nmae",
+                    baseline_emulations={"Simulations vs Simulations": sim_only[model]},
+                )
+                for model in ("ACCESS-ESM1-5", "MPI-ESM1-2-LR", "MIROC6")
+            }
+            plot_error_matrix_regional(error_data)
 
-        ax.plot(lags, obs_lc,  color="steelblue",  label="Simulation")
-        ax.plot(lags, pred_lc, color="darkorange", label="Emulation")
-        ax.axhline(0, color="black", linewidth=0.5)
-        ax.axhline( 1.96 / np.sqrt(T), color="steelblue", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.axhline(-1.96 / np.sqrt(T), color="steelblue", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.set_xlabel("Lag (months)")
-        ax.set_ylabel("Correlation")
-        ax.set_title(f"{index_region} → {target} (ensemble-mean removed)")
-        ax.legend(fontsize=8)
+    row_order : the three row axes, outermost first. Any permutation of
+        ``("model", "indicator", "comparison")``. Rows are the full product
+        in that order, so ``("indicator", "comparison", "model")`` groups all
+        models of one experiment together instead of all experiments of one
+        model.
+    models, indicators, comparisons : restrict and/or reorder each axis.
+        Default is everything, in first-seen order across the input. A
+        combination one model doesn't have (a baseline only some runs
+        include) is drawn in `missing_color` rather than dropped, so the grid
+        stays rectangular and the gap is visible.
+    regions : restrict and/or reorder the columns, e.g. ``["SOO", "MED", "WAF"]``.
+        Default is every region, in `error_data`'s own order.
+    sort_regions : ``None`` (default, keep `regions` order), ``"mean"`` /
+        ``"max"`` to order columns by the mean / max error across all rows
+        (worst first), or a callable ``(n_rows, n_cols) array -> column
+        order``. Sorting makes the worst regions cluster together but moves a
+        region's column between figures, so cross-referencing two figures
+        needs the default.
+    normalise : how colours map to values.
+        ``"indicator"`` (default)
+            One shared scale per indicator, across every model and
+            comparison, with one colourbar each. The right choice whenever
+            indicators carry different units — an MAE of 2 K and an MAE of
+            2 mm/day should not be the same colour.
+        ``"global"``
+            A single scale and colourbar for the whole matrix. Only
+            meaningful when every indicator shares units, or for a unitless
+            metric such as NMAE.
+        ``"row"``
+            Each row scaled to its own maximum, so every row spans the full
+            colour range. Shows the *shape* of each error pattern across
+            regions; absolute magnitudes become unreadable.
+    cmap : colormap for the error values.
+    vmin, vmax : the ends of the colour scale. Each takes a scalar,
+        ``{indicator: value}`` when ``normalise="indicator"``, or the string
+        ``"auto"`` for the data's own minimum / maximum. `vmin` defaults to
+        ``0`` — the same zero-anchored scale the maps use, which keeps
+        "how big is this error" readable. Set ``vmin="auto"`` when every row
+        has a similar error and the whole matrix comes out one flat colour:
+        it spends the full colour range on the differences *between* rows,
+        at the cost of no longer showing magnitude against zero. Passing
+        explicit numbers holds the scale fixed across several figures.
+        Both are ignored when ``normalise="row"``.
+    missing_color : colour for cells with no value (a missing combination, or
+        a NaN score).
+    show_values : write the number in each cell. Readable up to roughly a
+        dozen columns; leave off for all 58 regions.
+    value_fmt : format string used by `show_values`.
+    group_separators : draw a line between blocks of the outermost row axis,
+        and a lighter one between blocks of the middle axis.
+    figsize : defaults to a size derived from the row and column counts.
+    fontsize_tick, fontsize_label, cbar_label_fontsize : text sizes.
+    suptitle, save_path, dpi : as usual.
 
-    for ax in axes[n_plots:]:
-        ax.set_visible(False)
+    Returns
+    -------
+    matplotlib Figure
+    """
+    if tuple(sorted(row_order)) != tuple(sorted(_MATRIX_ROW_KEYS)):
+        raise ValueError(
+            f"row_order must be a permutation of {_MATRIX_ROW_KEYS}, got {row_order}"
+        )
+    if normalise not in ("indicator", "global", "row"):
+        raise ValueError("normalise must be 'indicator', 'global' or 'row'")
 
-    plt.tight_layout()
+    data, model_names, ind_names, cmp_names, all_regions = _resolve_matrix_inputs(
+        error_data, models, indicators, comparisons
+    )
+
+    # ── columns ─────────────────────────────────────────────────────────────
+    col_names = list(all_regions) if regions is None else list(regions)
+    unknown = [r for r in col_names if r not in all_regions]
+    if unknown:
+        raise ValueError(f"regions names unknown region(s) {unknown}")
+    col_idx = [all_regions.index(r) for r in col_names]
+
+    # ── rows: the full product of the three axes, outermost first ───────────
+    axis_values = {"model": model_names, "indicator": ind_names, "comparison": cmp_names}
+    rows = [{}]
+    for key in row_order:
+        rows = [{**r, key: v} for r in rows for v in axis_values[key]]
+
+    n_rows, n_cols = len(rows), len(col_names)
+    values = np.full((n_rows, n_cols), np.nan)
+    for r, row in enumerate(rows):
+        ed = data[row["model"]]
+        scores = ed.scores.get(row["comparison"], {}).get(row["indicator"])
+        if scores is not None:
+            values[r] = np.asarray(scores, dtype=float)[col_idx]
+
+    if np.all(np.isnan(values)):
+        raise ValueError(
+            "no scores matched — check that `indicators` and `comparisons` name "
+            "things the ErrorData objects actually contain."
+        )
+
+    # ── optional column reordering ──────────────────────────────────────────
+    if sort_regions is not None:
+        if callable(sort_regions):
+            order = np.asarray(sort_regions(values), dtype=int)
+        elif sort_regions in ("mean", "max"):
+            agg = np.nanmean if sort_regions == "mean" else np.nanmax
+            with np.errstate(invalid="ignore"):
+                stat = agg(np.where(np.isnan(values), np.nan, values), axis=0)
+            order = np.argsort(np.where(np.isnan(stat), -np.inf, stat))[::-1]
+        else:
+            raise ValueError("sort_regions must be None, 'mean', 'max', or a callable")
+        values = values[:, order]
+        col_names = [col_names[i] for i in order]
+
+    # ── colour normalisation ────────────────────────────────────────────────
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad(missing_color)
+
+    def _limit(spec, key, auto_value, default):
+        """Resolve one end of a colour scale from a scalar / dict / 'auto'."""
+        if isinstance(spec, dict):
+            spec = spec.get(key, default)
+        if spec is None:
+            spec = default
+        if isinstance(spec, str):
+            if spec != "auto":
+                raise ValueError(f"vmin/vmax strings must be 'auto', got {spec!r}")
+            return auto_value
+        return float(spec)
+
+    def _norm_for(key, subset) -> mcolors.Normalize:
+        with np.errstate(invalid="ignore"):
+            lo_auto = float(np.nanmin(subset)) if subset.size else 0.0
+            hi_auto = float(np.nanmax(subset)) if subset.size else 1.0
+        if not np.isfinite(lo_auto):
+            lo_auto = 0.0
+        if not np.isfinite(hi_auto):
+            hi_auto = 1.0
+        lo = _limit(vmin, key, lo_auto, 0.0)
+        hi = _limit(vmax, key, hi_auto, hi_auto)
+        if hi <= lo:  # degenerate (all cells equal, or a bad override)
+            hi = lo + max(abs(lo) * 1e-6, 1e-9)
+        return mcolors.Normalize(lo, hi)
+
+    row_indicators = [row["indicator"] for row in rows]
+    if normalise == "row":
+        with np.errstate(invalid="ignore"):
+            row_max = np.nanmax(np.abs(values), axis=1)
+        row_max = np.where(~np.isfinite(row_max) | (row_max == 0), 1.0, row_max)
+        scaled = values / row_max[:, None]
+        cbar_specs = [("fraction of row maximum", mcolors.Normalize(0, 1))]
+    else:
+        if normalise == "global":
+            norms = {None: _norm_for(None, values)}
+            key_of_row = [None] * n_rows
+            cbar_specs = [(_matrix_metric_label(data, model_names), norms[None])]
+        else:
+            norms = {}
+            for ind in ind_names:
+                mask = np.array([ri == ind for ri in row_indicators])
+                norms[ind] = _norm_for(ind, values[mask] if mask.any() else values[:0])
+            key_of_row = row_indicators
+            ref_ed = data[model_names[0]]
+            cbar_specs = [
+                (f"{_matrix_metric_label(data, model_names)} "
+                 f"[{_colorbar_unit(ref_ed, ind, None)}]", norms[ind])
+                for ind in ind_names if ind in norms
+            ]
+        scaled = np.empty_like(values)
+        for r in range(n_rows):
+            scaled[r] = norms[key_of_row[r]](values[r])
+
+    rgba = cmap_obj(np.ma.masked_invalid(scaled))
+
+    # ── figure ──────────────────────────────────────────────────────────────
+    row_labels = [
+        " \N{MIDDLE DOT} ".join(
+            _matrix_row_part(data, row, key) for key in row_order
+            if _matrix_row_part(data, row, key)
+        )
+        for row in rows
+    ]
+    label_width_in = 0.06 * fontsize_tick * max((len(s) for s in row_labels), default=1)
+    if figsize is None:
+        figsize = (
+            max(6.0, label_width_in + 0.19 * n_cols),
+            max(2.2, 0.9 + 0.24 * n_rows),
+        )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(rgba, aspect="auto", interpolation="nearest", origin="upper")
+
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(col_names, rotation=90, fontsize=fontsize_tick)
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels(row_labels, fontsize=fontsize_tick)
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.5)
+    ax.tick_params(which="minor", length=0)
+    ax.tick_params(which="major", length=2, pad=2)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.5)
+        spine.set_color("0.6")
+
+    if group_separators and n_rows > 1:
+        outer_len = len(axis_values[row_order[0]])
+        middle_len = len(axis_values[row_order[1]])
+        block = n_rows // max(outer_len, 1)
+        sub = block // max(middle_len, 1)
+        for r in range(1, n_rows):
+            if block and r % block == 0:
+                ax.axhline(r - 0.5, color="0.1", linewidth=1.2, zorder=5)
+            elif sub and r % sub == 0:
+                ax.axhline(r - 0.5, color="0.45", linewidth=0.7, zorder=4)
+
+    if show_values:
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if np.isnan(values[r, c]):
+                    continue
+                lum = 0.299 * rgba[r, c, 0] + 0.587 * rgba[r, c, 1] + 0.114 * rgba[r, c, 2]
+                ax.text(c, r, value_fmt.format(values[r, c]), ha="center", va="center",
+                        fontsize=max(fontsize_tick - 1, 3),
+                        color="white" if lum < 0.5 else "0.1")
+
+    ax.set_xlabel("Region", fontsize=fontsize_label, labelpad=4)
+
+    # ── colourbars, one per scale, in a row underneath ──────────────────────
+    fig.canvas.draw()
+    pos = ax.get_position()
+    fig_h = fig.get_size_inches()[1]
+    cbar_h = 0.13 / fig_h
+    gap = 0.75 / fig_h
+    n_cb = len(cbar_specs)
+    span = pos.width / n_cb
+    for i, (label, norm) in enumerate(cbar_specs):
+        cax = fig.add_axes([pos.x0 + i * span, pos.y0 - gap - cbar_h, span * 0.82, cbar_h])
+        cb = fig.colorbar(
+            plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj), cax=cax, orientation="horizontal"
+        )
+        cb.set_label(label, fontsize=cbar_label_fontsize)
+        cb.ax.tick_params(labelsize=cbar_label_fontsize - 1)
+        cb.outline.set_linewidth(0.5)
+
+    fig.suptitle(
+        suptitle or f"Per-Region {_matrix_metric_label(data, model_names)}",
+        fontsize=12, y=pos.y1 + 0.6 / fig_h,
+    )
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
     return fig
 
+
+def _matrix_metric_label(data: dict, model_names: list[str]) -> str:
+    return data[model_names[0]].metric_label
+
+
+def _matrix_row_part(data: dict, row: dict, key: str) -> str:
+    """The text for one level of a matrix row label."""
+    if key == "model":
+        return row["model"]
+    if key == "comparison":
+        return row["comparison"]
+    ed = data[row["model"]]
+    return ed.short_label(row["indicator"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Timeseries ranking grid
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensemble_stats(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """arr : (n_members, T) -> median, p5, p95, each (T,)."""
+    return np.median(arr, axis=0), np.percentile(arr, 5, axis=0), np.percentile(arr, 95, axis=0)
+
+
+def _plot_ensemble_band(ax, years, arr, color, label, zorder=2):
+    """Draw individual members (faint) + median + 90% CI shading."""
+    med, p5, p95 = _ensemble_stats(arr)
+    for member in arr:
+        ax.plot(years, member, color=color, lw=_PAPER_LW_MEMBER,
+                alpha=_PAPER_ALPHA_MEMBERS, zorder=zorder)
+    ax.fill_between(years, p5, p95, color=color, alpha=_PAPER_ALPHA_CI,
+                    zorder=zorder + 1, linewidth=0)
+    ax.plot(years, med, color=color, lw=_PAPER_LW_MEDIAN, label=label, zorder=zorder + 2)
+
+
+def _timeseries_legend(baselines) -> list:
+    handles = [
+        mlines.Line2D([], [], color=_PAPER_C["sim"], lw=_PAPER_LW_MEDIAN,
+                      label="Simulation (median + 90 % CI)"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MEDIAN,
+                      label="Emulator (median + 90 % CI)"),
+    ]
+    for b_idx, bname in enumerate(baselines):
+        handles.append(mlines.Line2D([], [], color=_baseline_color(b_idx),
+                                     lw=_PAPER_LW_BASELINE, linestyle="--", label=bname))
+    handles += [
+        mpatches.Patch(color=_PAPER_C["sim"], alpha=_PAPER_ALPHA_CI + 0.15, label="Simulation 90 % CI"),
+        mpatches.Patch(color=_PAPER_C["emulator"], alpha=_PAPER_ALPHA_CI + 0.15, label="Emulator 90 % CI"),
+    ]
+    return handles
+
+
+def _plot_timeseries_core(
+    error_data, sim, emulator, baseline_emulations, years,
+    selection, share_y_per_row, indicator_units, panel_width, panel_height,
+    fontsize_title, fontsize_ax, fontsize_legend, suptitle, save_path, dpi,
+) -> plt.Figure:
+    n_time = np.asarray(sim[error_data.indicators[0]]).shape[1]
+    years = np.arange(n_time) if years is None else np.asarray(years)
+    baselines = baseline_emulations or {}
+
+    def draw_cell(ax, indicator, uidx):
+        _plot_ensemble_band(ax, years, np.asarray(sim[indicator])[:, :, uidx],
+                            color=_PAPER_C["sim"], label="Simulation", zorder=2)
+        _plot_ensemble_band(ax, years, np.asarray(emulator[indicator])[:, :, uidx],
+                            color=_PAPER_C["emulator"], label="Emulator", zorder=3)
+        for b_idx, (bname, barrs) in enumerate(baselines.items()):
+            b_data = np.asarray(barrs[indicator])[:, :, uidx]
+            ax.plot(years, np.median(b_data, axis=0), color=_baseline_color(b_idx),
+                    lw=_PAPER_LW_BASELINE, linestyle="--", label=bname, zorder=4)
+
+    def row_ylabel(indicator):
+        unit = _indicator_unit(error_data, indicator, indicator_units)
+        short = error_data.short_label(indicator)
+        return f"{short} [{unit}]" if unit else short
+
+    return _ranking_grid(
+        error_data, draw_cell=draw_cell, selection=selection,
+        share_y_per_row=share_y_per_row,
+        row_ylabel=row_ylabel, xlabel="Year",
+        legend_handles=_timeseries_legend(baselines),
+        panel_width=panel_width, panel_height=panel_height,
+        fontsize_title=fontsize_title, fontsize_ax=fontsize_ax,
+        fontsize_legend=fontsize_legend, hspace=0.42, wspace=0.32,
+        show_ranking_source=True, suptitle=suptitle, save_path=save_path, dpi=dpi,
+        per_cell_setup=lambda ax: ax.xaxis.set_major_locator(
+            plt.MaxNLocator(nbins=4, integer=True, prune="both")
+        ),
+    )
+
+
+def plot_timeseries_regional(
+    error_data: ErrorData,
+    sim: dict[str, np.ndarray],
+    emulator: dict[str, np.ndarray],
+    baseline_emulations: dict[str, dict[str, np.ndarray]] | None = None,
+    years: np.ndarray | None = None,
+    *,
+    selection=None,
+    share_y_per_row: bool = False,
+    indicator_units: dict[str, str] | None = None,
+    panel_width: float = 3.4,
+    panel_height: float = 2.2,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Timeseries of selected AR6 regions — by default the best, median and
+    worst region per `error_data.ranking` — one row per indicator.
+
+    Each panel shows the Simulation and Emulator ensembles (faint members +
+    median + 90 % CI) plus one dashed median line per baseline.
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` — supplies the
+        ranking, the per-unit scores shown in each panel title, the metric
+        label, and the indicator list/labels/units.
+    sim, emulator : ``{indicator: (n_members, T, n_regions)}`` — the same
+        preprocessed arrays `error_data` was built from.
+    baseline_emulations : ``{name: {indicator: array}}`` — same baselines and
+        preprocessing as passed to `build_error_data_regional`.
+    years : x-axis values, length T. Defaults to 0..T-1.
+    selection : which regions to show, one per column. ``None`` (default)
+        gives best / median / worst. A list of 1-based ranks, e.g.
+        ``[1, 2, 3]``, shows the three best. A list of region abbreviations,
+        e.g. ``["SOO", "MED"]``, shows exactly those. See `resolve_selection`.
+    share_y_per_row : if True, every panel in a row (i.e. every region shown
+        for one indicator) gets the same y-limits, so columns are directly
+        comparable. Default False — each panel scales to its own data.
+    indicator_units : override the unit strings in the y-axis labels.
+    (remaining parameters control figure geometry/cosmetics)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    return _plot_timeseries_core(
+        error_data, sim, emulator, baseline_emulations, years,
+        selection, share_y_per_row, indicator_units, panel_width, panel_height,
+        fontsize_title, fontsize_ax, fontsize_legend, suptitle, save_path, dpi,
+    )
+
+
+def plot_timeseries_gridded(
+    error_data: ErrorData,
+    sim: dict,
+    emulator: dict,
+    baseline_emulations: dict | None = None,
+    years: np.ndarray | None = None,
+    *,
+    selection=None,
+    share_y_per_row: bool = False,
+    indicator_units: dict[str, str] | None = None,
+    panel_width: float = 3.4,
+    panel_height: float = 2.2,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Gridded analogue of `plot_timeseries_regional`: timeseries of selected
+    gridpoints, one row per indicator.
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_gridded`
+    sim, emulator : ``{indicator: preprocessing.GriddedArray}`` — the same
+        preprocessed arrays `error_data` was built from.
+    baseline_emulations : ``{name: {indicator: GriddedArray}}``
+    selection : ``None`` for best / median / worst, a list of 1-based ranks,
+        or a list of gridpoints given as ``(lat, lon)`` pairs or
+        ``"(45.00°, 10.00°)"``-style labels. See `resolve_selection`.
+    (remaining parameters: see `plot_timeseries_regional`)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    def _values(d):
+        return {k: v.values for k, v in d.items()}
+
+    baselines_values = None
+    if baseline_emulations:
+        baselines_values = {n: _values(a) for n, a in baseline_emulations.items()}
+    return _plot_timeseries_core(
+        error_data, _values(sim), _values(emulator), baselines_values, years,
+        selection, share_y_per_row, indicator_units, panel_width, panel_height,
+        fontsize_title, fontsize_ax, fontsize_legend, suptitle, save_path, dpi,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QQ scatter — one function for both regional and gridded data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sim_vs_sim_band(sim: np.ndarray, j: int, quantiles: np.ndarray,
+                     n_boot: int, rng: np.random.Generator):
+    """
+    Draw `n_boot` random half-splits of the simulation ensemble at unit j,
+    compute QQ curves of split-A quantiles vs split-B quantiles, and return
+    (sim_quantiles, band_low_p5, band_high_p95). x-axis reference = quantiles
+    of the full sim ensemble.
+    """
+    n = sim.shape[0]
+    half = max(n // 2, 1)
+    curves = []
+    for _ in range(n_boot):
+        idx_a = rng.choice(n, size=half, replace=False)
+        idx_b = np.setdiff1d(np.arange(n), idx_a)
+        if len(idx_b) == 0:
+            idx_b = idx_a
+        qa = np.quantile(sim[idx_a, :, j].ravel(), quantiles)
+        qb = np.quantile(sim[idx_b, :, j].ravel(), quantiles)
+        curves.append(qb - qa)
+    curves = np.array(curves)
+    q_ref = np.quantile(sim[:, :, j].ravel(), quantiles)
+    return q_ref, q_ref + np.percentile(curves, 5, axis=0), q_ref + np.percentile(curves, 95, axis=0)
+
+
+def plot_qq_scatter(
+    error_data: ErrorData,
+    sim: dict[str, np.ndarray],
+    emulator: dict[str, np.ndarray],
+    baseline_emulations: dict[str, dict[str, np.ndarray]] | None = None,
+    *,
+    selection=None,
+    share_y_per_row: bool = False,
+    quantiles: np.ndarray = DEFAULT_QQ_QUANTILES,
+    n_boot: int = 200,
+    random_seed: int = 0,
+    indicator_units: dict[str, str] | None = None,
+    equal_aspect: bool = True,
+    panel_width: float = 3.4,
+    panel_height: float = 2.4,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    QQ scatter of selected units, one row per indicator. One function for
+    both regional and gridded data — pass plain
+    ``{indicator: (n_members, T, n_units)}`` arrays either way (for gridded,
+    that's ``mesh_array.values``).
+
+    Each panel:
+      x-axis    : simulation quantiles (full ensemble, flattened)
+      y-axis    : emulator / baseline quantiles
+      grey band : 5th–95th percentile of `n_boot` sim-vs-sim QQ residuals
+      diagonal  : perfect-emulation reference
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` /
+        `build_error_data_gridded`, built with a quantile-curve metric
+        ("qq_mae", "qq_nmae", "qq_ks", "qq_tail_mae") so the ranking reflects
+        QQ error rather than a raw-timeseries error.
+    sim, emulator : ``{indicator: (n_members, T, n_units)}`` — the same
+        preprocessed arrays `error_data` was built from, usually with the
+        ensemble mean removed (`preprocess_*(..., remove_ensemble_mean=True)`).
+    baseline_emulations : ``{name: {indicator: array}}``
+    selection : which units to show — see `resolve_selection`.
+    share_y_per_row : give every panel in a row the same y-limits (default
+        False). Note this only equalises the *y* axis; with
+        ``equal_aspect=True`` the x range follows, keeping panels square.
+    quantiles : quantile levels plotted (match what `error_data` was built with)
+    n_boot, random_seed : sim-vs-sim bootstrap settings for the grey band
+    equal_aspect : keep a 1:1 data aspect so the diagonal is at 45°
+    (remaining parameters control figure geometry/cosmetics)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    rng = np.random.default_rng(random_seed)
+    baselines = baseline_emulations or {}
+
+    def draw_cell(ax, indicator, uidx):
+        sim_arr = np.asarray(sim[indicator])
+        q_ref, band_lo, band_hi = _sim_vs_sim_band(sim_arr, uidx, quantiles, n_boot, rng)
+        ax.fill_between(q_ref, band_lo, band_hi, color=_PAPER_C["sim_band"],
+                        alpha=_PAPER_ALPHA_BAND, linewidth=0, zorder=1)
+        ax.plot(q_ref, q_ref, color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG,
+                linestyle="--", zorder=2)
+        q_emu = np.quantile(np.asarray(emulator[indicator])[:, :, uidx].ravel(), quantiles)
+        ax.plot(q_ref, q_emu, color=_PAPER_C["emulator"], lw=_PAPER_LW_MAIN, zorder=4)
+        for b_idx, (bname, barrs) in enumerate(baselines.items()):
+            q_b = np.quantile(np.asarray(barrs[indicator])[:, :, uidx].ravel(), quantiles)
+            ax.plot(q_ref, q_b, color=_baseline_color(b_idx), lw=_PAPER_LW_MAIN,
+                    linestyle="--", zorder=3)
+
+    def row_ylabel(indicator):
+        unit = _indicator_unit(error_data, indicator, indicator_units)
+        return f"Emulated [{unit}]" if unit else "Emulated"
+
+    def setup(ax):
+        if equal_aspect:
+            ax.set_aspect("equal", adjustable="datalim")
+        ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=4, prune="both"))
+        ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=4, prune="both"))
+
+    legend_handles = [
+        mpatches.Patch(color=_PAPER_C["sim_band"], alpha=_PAPER_ALPHA_BAND + 0.2,
+                       label="Sim-Sim 90 % band"),
+        mlines.Line2D([], [], color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG,
+                      linestyle="--", label="Perfect (diagonal)"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MAIN, label="Emulator"),
+    ]
+    for b_idx, bname in enumerate(baselines):
+        legend_handles.append(mlines.Line2D([], [], color=_baseline_color(b_idx),
+                                            lw=_PAPER_LW_MAIN, linestyle="--", label=bname))
+
+    return _ranking_grid(
+        error_data, draw_cell=draw_cell, selection=selection,
+        share_y_per_row=share_y_per_row,
+        row_ylabel=row_ylabel, xlabel="Simulated",
+        legend_handles=legend_handles,
+        panel_width=panel_width, panel_height=panel_height,
+        fontsize_title=fontsize_title, fontsize_ax=fontsize_ax,
+        fontsize_legend=fontsize_legend, hspace=0.48, wspace=0.35,
+        show_ranking_source=False, suptitle=suptitle, save_path=save_path, dpi=dpi,
+        per_cell_setup=setup,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autocorrelation curves — one function for both regional and gridded data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_temporal_correlation_curves(
+    error_data: ErrorData,
+    sim: dict[str, np.ndarray],
+    emulator: dict[str, np.ndarray],
+    baseline_emulations: dict[str, dict[str, np.ndarray]] | None = None,
+    *,
+    n_lags: int = DEFAULT_TEMPORAL_CORR_N_LAGS,
+    window: int | None = None,
+    selection=None,
+    share_y_per_row: bool = False,
+    panel_width: float = 3.4,
+    panel_height: float = 2.2,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Temporal-autocorrelation curves — lag on the x-axis, autocorrelation on
+    the y-axis — for selected units, one row per indicator. One function for
+    both regional and gridded data: pass plain
+    ``{indicator: (n_members, T, n_units)}`` arrays either way (for gridded,
+    that's ``mesh_array.values``).
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` /
+        `build_error_data_gridded`, built with ``metric="temporal_corr_nmae"``
+        so the ranking reflects the distance between simulated and emulated
+        autocorrelation curves.
+    sim, emulator : ``{indicator: (n_members, T, n_units)}`` — the same
+        preprocessed arrays `error_data` was built from.
+    baseline_emulations : ``{name: {indicator: array}}`` — drawn as a dashed
+        curve each.
+    n_lags, window : must match what `error_data` was built with — the number
+        of lags plotted and the trailing-window length used by
+        `metrics.compute_temporal_correlation_curve`.
+    selection : which units to show — see `resolve_selection`.
+    share_y_per_row : give every panel in a row the same y-limits (default
+        False).
+    (remaining parameters control figure geometry/cosmetics)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    lags = np.arange(n_lags + 1)
+    baselines = baseline_emulations or {}
+
+    def draw_cell(ax, indicator, uidx):
+        ax.axhline(0, color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG, linestyle=":", zorder=1)
+        sim_curve = compute_temporal_correlation_curve(
+            np.asarray(sim[indicator])[:, :, uidx], n_lags, window)
+        emu_curve = compute_temporal_correlation_curve(
+            np.asarray(emulator[indicator])[:, :, uidx], n_lags, window)
+        ax.plot(lags, sim_curve, color=_PAPER_C["sim"], lw=_PAPER_LW_MEDIAN, zorder=3)
+        ax.plot(lags, emu_curve, color=_PAPER_C["emulator"], lw=_PAPER_LW_MEDIAN, zorder=4)
+        for b_idx, (bname, barrs) in enumerate(baselines.items()):
+            b_curve = compute_temporal_correlation_curve(
+                np.asarray(barrs[indicator])[:, :, uidx], n_lags, window)
+            ax.plot(lags, b_curve, color=_baseline_color(b_idx),
+                    lw=_PAPER_LW_BASELINE, linestyle="--", zorder=2)
+
+    legend_handles = [
+        mlines.Line2D([], [], color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG,
+                      linestyle=":", label="Zero correlation"),
+        mlines.Line2D([], [], color=_PAPER_C["sim"], lw=_PAPER_LW_MEDIAN, label="Simulation"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MEDIAN, label="Emulator"),
+    ]
+    for b_idx, bname in enumerate(baselines):
+        legend_handles.append(mlines.Line2D([], [], color=_baseline_color(b_idx),
+                                            lw=_PAPER_LW_BASELINE, linestyle="--", label=bname))
+
+    return _ranking_grid(
+        error_data, draw_cell=draw_cell, selection=selection,
+        share_y_per_row=share_y_per_row,
+        row_ylabel=lambda i: f"{error_data.short_label(i)} autocorrelation",
+        xlabel="Lag (timesteps)", legend_handles=legend_handles,
+        panel_width=panel_width, panel_height=panel_height,
+        fontsize_title=fontsize_title, fontsize_ax=fontsize_ax,
+        fontsize_legend=fontsize_legend, hspace=0.42, wspace=0.32,
+        show_ranking_source=True, suptitle=suptitle, save_path=save_path, dpi=dpi,
+        per_cell_setup=lambda ax: ax.xaxis.set_major_locator(
+            plt.MaxNLocator(nbins=4, integer=True, prune="both")
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Power spectral density curves — one function for both regional and gridded
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_psd_curves(
+    error_data: ErrorData,
+    sim: dict[str, np.ndarray],
+    emulator: dict[str, np.ndarray],
+    baseline_emulations: dict[str, dict[str, np.ndarray]] | None = None,
+    *,
+    fs: float = 1.0,
+    nperseg: int | None = None,
+    x_axis: str = "period",
+    log_x: bool = True,
+    log_y: bool = True,
+    band: tuple[float, float] = (10, 90),
+    reference_periods: dict[str, float] | None = None,
+    selection=None,
+    share_y_per_row: bool = False,
+    panel_width: float = 3.4,
+    panel_height: float = 2.2,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Power spectral density curves for selected units, one row per indicator
+    — the curve counterpart of `plot_temporal_correlation_curves`, and the
+    companion figure to a ``metric="psd_log_nmae"`` (or "psd_nmae" /
+    "psd_wasserstein") map.
+
+    Each panel shows the member-median PSD for the Simulation and the
+    Emulator with a shaded inter-member percentile band, so you can see
+    whether an emulator/simulation gap is larger than the spread across
+    ensemble members, plus one dashed median curve per baseline.
+
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_regional` /
+        `build_error_data_gridded`, built with a PSD metric so the ranking
+        reflects the distance between simulated and emulated spectra.
+    sim, emulator : ``{indicator: (n_members, T, n_units)}`` — the same
+        preprocessed arrays `error_data` was built from (for gridded, pass
+        ``mesh_array.values``). Remove the ensemble mean first
+        (`preprocess_*(..., remove_ensemble_mean=True)`) if you want a pure
+        internal-variability spectrum.
+    baseline_emulations : ``{name: {indicator: array}}``
+    fs, nperseg : sampling frequency and Welch segment length — pass the same
+        values used to build `error_data` (`psd_fs` / `psd_nperseg`) so the
+        curves match the scores. With monthly data, ``fs=1`` gives
+        cycles/month; ``fs=12`` gives cycles/year.
+    x_axis : "period" (default, ``1/f``, the usual way to read a climate
+        spectrum) or "frequency".
+    log_x, log_y : log-scale the axes (both default True — a PSD normally
+        spans several orders of magnitude).
+    band : inter-member percentiles shaded around each median curve, as
+        ``(low, high)``. Default (10, 90).
+    reference_periods : optional vertical guide lines, e.g.
+        ``{"Annual": 12, "ENSO ~3 yr": 36}`` — keys are labels, values are
+        periods **in timesteps** (they are converted using `fs`, so they land
+        correctly whichever `x_axis` is chosen). Pass ``{}`` for none;
+        default draws annual and semi-annual lines when the data looks
+        monthly (``fs`` of 1 or 12).
+    selection : which units to show — see `resolve_selection`.
+    share_y_per_row : give every panel in a row the same y-limits (default
+        False).
+    (remaining parameters control figure geometry/cosmetics)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    if x_axis not in ("period", "frequency"):
+        raise ValueError("x_axis must be 'period' or 'frequency'")
+    baselines = baseline_emulations or {}
+    lo_pct, hi_pct = band
+
+    if reference_periods is None:
+        reference_periods = {"Annual": 12, "Semi-annual": 6} if fs in (1.0, 1, 12, 12.0) else {}
+
+    def _x_of(freqs):
+        keep = freqs > 0
+        return keep, (1.0 / freqs[keep] if x_axis == "period" else freqs[keep])
+
+    def draw_cell(ax, indicator, uidx):
+        freqs, psd_sim = compute_psd_curves(np.asarray(sim[indicator])[:, :, uidx], fs, nperseg)
+        keep, x = _x_of(freqs)
+        for arr, color in ((psd_sim, _PAPER_C["sim"]),
+                           (compute_psd_curves(np.asarray(emulator[indicator])[:, :, uidx],
+                                               fs, nperseg)[1], _PAPER_C["emulator"])):
+            vals = arr[:, keep]
+            ax.fill_between(x, np.percentile(vals, lo_pct, axis=0),
+                            np.percentile(vals, hi_pct, axis=0),
+                            color=color, alpha=_PAPER_ALPHA_CI, linewidth=0, zorder=2)
+            ax.plot(x, np.median(vals, axis=0), color=color, lw=_PAPER_LW_MEDIAN, zorder=4)
+        for b_idx, (bname, barrs) in enumerate(baselines.items()):
+            _, psd_b = compute_psd_curves(np.asarray(barrs[indicator])[:, :, uidx], fs, nperseg)
+            ax.plot(x, np.median(psd_b[:, keep], axis=0), color=_baseline_color(b_idx),
+                    lw=_PAPER_LW_BASELINE, linestyle="--", zorder=3)
+        for label, period_steps in reference_periods.items():
+            xv = period_steps / fs if x_axis == "period" else fs / period_steps
+            ax.axvline(xv, color="0.55", linestyle=":", linewidth=0.8, zorder=1)
+
+    def setup(ax):
+        if log_x:
+            ax.set_xscale("log")
+        if log_y:
+            ax.set_yscale("log")
+
+    freq_unit = "cycles / timestep" if fs == 1.0 else "cycles / time unit"
+    xlabel = "Period (timesteps)" if x_axis == "period" else f"Frequency ({freq_unit})"
+
+    legend_handles = [
+        mlines.Line2D([], [], color=_PAPER_C["sim"], lw=_PAPER_LW_MEDIAN,
+                      label=f"Simulation (median + {lo_pct:g}\N{EN DASH}{hi_pct:g} %)"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MEDIAN,
+                      label=f"Emulator (median + {lo_pct:g}\N{EN DASH}{hi_pct:g} %)"),
+    ]
+    for b_idx, bname in enumerate(baselines):
+        legend_handles.append(mlines.Line2D([], [], color=_baseline_color(b_idx),
+                                            lw=_PAPER_LW_BASELINE, linestyle="--", label=bname))
+    if reference_periods:
+        legend_handles.append(mlines.Line2D([], [], color="0.55", linestyle=":", linewidth=0.8,
+                                            label=" / ".join(reference_periods)))
+
+    return _ranking_grid(
+        error_data, draw_cell=draw_cell, selection=selection,
+        share_y_per_row=share_y_per_row,
+        row_ylabel=lambda i: f"{error_data.short_label(i)} PSD",
+        xlabel=xlabel, legend_handles=legend_handles,
+        panel_width=panel_width, panel_height=panel_height,
+        fontsize_title=fontsize_title, fontsize_ax=fontsize_ax,
+        fontsize_legend=fontsize_legend, hspace=0.42, wspace=0.32,
+        show_ranking_source=True, suptitle=suptitle, save_path=save_path, dpi=dpi,
+        per_cell_setup=setup,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial correlation matrices (regional only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_correlation_comparison(
+    correlation_data: dict[str, dict],
+    region_names: list[str] | None = None,
+    figsize_per_panel: float = 4.5,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Spatial correlation matrices for the Emulator and every baseline, side by
+    side with their difference from the simulation. One row per comparison.
+
+    Parameters
+    ----------
+    correlation_data : from `metrics.build_correlation_data` —
+        ``{comparison: {"sim_corr", "emu_corr", "diff", "mae", "rmse"}}``.
+        One indicator at a time, since the correlation is *across regions*.
+    region_names : labels for the matrix axes (length n_regions)
+    figsize_per_panel, suptitle, save_path, dpi : as usual
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    comparisons = list(correlation_data)
+    m = correlation_data[comparisons[0]]["sim_corr"].shape[0]
+    labels = region_names if region_names is not None else [str(i) for i in range(m)]
+
+    n_rows, n_cols = len(comparisons), 3
+    fw = figsize_per_panel * n_cols + 1.5
+    fh = figsize_per_panel * n_rows + 0.8
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fw, fh), squeeze=False,
+                             gridspec_kw={"hspace": 0.05, "wspace": 0.05})
+
+    col_titles = ["Simulation correlations", "Emulation correlations", "Difference (emu \N{MINUS SIGN} sim)"]
+    cbar_labels = ["Correlation (sim)", "Correlation (emu)", "Difference"]
+    im_handles = {}
+    diff_abs_global = max(max(np.abs(correlation_data[c]["diff"]).max() for c in comparisons), 1e-9)
+    panels_template = [
+        ("sim_corr", "RdBu_r", -1, 1),
+        ("emu_corr", "RdBu_r", -1, 1),
+        ("diff", "PiYG", -diff_abs_global, diff_abs_global),
+    ]
+
+    for row_idx, label in enumerate(comparisons):
+        res = correlation_data[label]
+        for col_idx, (key, cmap, vmin, vmax) in enumerate(panels_template):
+            ax = axes[row_idx, col_idx]
+            im = ax.imshow(res[key], cmap=cmap, vmin=vmin, vmax=vmax,
+                           aspect="equal", interpolation="nearest")
+            im_handles[(row_idx, col_idx)] = im
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.tick_params(axis="both", which="both", length=2, pad=2)
+            if row_idx == n_rows - 1:
+                ax.set_xticks(range(m))
+                ax.set_xticklabels(labels, rotation=90, fontsize=5, ha="center")
+            else:
+                ax.set_xticks([])
+            if col_idx == 0:
+                ax.set_yticks(range(m))
+                ax.set_yticklabels(labels, fontsize=5, va="center")
+            else:
+                ax.set_yticks([])
+            if row_idx == 0:
+                ax.set_title(col_titles[col_idx], fontsize=9, pad=6)
+        axes[row_idx, 0].text(
+            -0.18, 0.5, f"{label}\nMAE {res['mae']:.3f} | RMSE {res['rmse']:.3f}",
+            transform=axes[row_idx, 0].transAxes, ha="center", va="center",
+            fontsize=7, fontweight="bold", rotation=90,
+        )
+
+    fig.canvas.draw()
+    fig_height = fig.get_size_inches()[1]
+    cbar_height_inches, cbar_gap_inches = 0.12, 0.6
+    cbar_height_fig = cbar_height_inches / fig_height
+    for col_idx in range(n_cols):
+        pos = axes[-1, col_idx].get_position()
+        gap_fig = cbar_gap_inches / fig_height
+        cbar_ax = fig.add_axes([pos.x0, pos.y0 - gap_fig - cbar_height_fig, pos.width, cbar_height_fig])
+        cb = fig.colorbar(im_handles[(n_rows - 1, col_idx)], cax=cbar_ax, orientation="horizontal")
+        cb.set_label(cbar_labels[col_idx], fontsize=8)
+        cb.ax.tick_params(labelsize=7)
+        cb.outline.set_linewidth(0.5)
+
+    fig.subplots_adjust(top=0.93)
+    fig.suptitle(suptitle or "Spatial correlations", fontsize=12, y=0.96)
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRPS timeseries (gridded — the CRPS *map* is plot_map_gridded(metric="crps"))
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_crps_timeseries_gridded(
+    crps_data: dict,
+    years: np.ndarray | None = None,
+    *,
+    share_y: bool = False,
+    indicator_units: dict[str, str] | None = None,
+    panel_width: float = 6.0,
+    panel_height: float = 2.4,
+    fontsize_title: int = 9,
+    fontsize_ax: int = 8,
+    fontsize_legend: int = 8,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Spatially-averaged CRPS at every timestep, one line per comparison and
+    one row per indicator. Unlike `plot_timeseries_gridded` there is no
+    best/median/worst split — spatial averaging already collapsed the
+    gridpoint axis.
+
+    Parameters
+    ----------
+    crps_data : from `metrics.build_crps_timeseries_data_gridded` — a dict
+        with "indicators", "indicator_labels", "indicator_units" and
+        ``series[comparison][indicator] -> (T,)``.
+    years : x-axis values, length T. Defaults to 0..T-1.
+    share_y : give every row the same y-limits (default False).
+    indicator_units : override the unit strings in the y-axis labels.
+    (remaining parameters control figure geometry/cosmetics)
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    indicators = crps_data["indicators"]
+    labels = crps_data["indicator_labels"]
+    units = dict(crps_data["indicator_units"])
+    units.update(indicator_units or {})
+    series = crps_data["series"]
+
+    comparisons = list(series)
+    n_time = len(series[comparisons[0]][indicators[0]])
+    years = np.arange(n_time) if years is None else np.asarray(years)
+
+    n_rows = len(indicators)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(panel_width, panel_height * n_rows),
+                             squeeze=False, gridspec_kw={"hspace": 0.35})
+    axes = axes[:, 0]
+
+    line_colors = {"Emulator": _PAPER_C["emulator"]}
+    baseline_names = [c for c in comparisons if c != "Emulator"]
+    for b_idx, bname in enumerate(baseline_names):
+        line_colors[bname] = _baseline_color(b_idx)
+
+    for row_idx, indicator in enumerate(indicators):
+        ax = axes[row_idx]
+        ax.axhline(0, color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG, linestyle="--", zorder=1)
+        for label in comparisons:
+            ax.plot(years, series[label][indicator], color=line_colors[label],
+                    lw=_PAPER_LW_MAIN, label=label, zorder=3)
+        _style_axes(ax, fontsize_ax)
+        unit = units.get(indicator, "")
+        ax.set_ylabel(f"CRPS  [{unit}]" if unit else "CRPS", fontsize=fontsize_ax)
+        ax.set_title(f"{labels[indicator]} — spatial-mean CRPS over time",
+                     fontsize=fontsize_title, pad=4)
+        if row_idx == n_rows - 1:
+            ax.set_xlabel("Year", fontsize=fontsize_ax)
+
+    if share_y:
+        _apply_share_y(list(axes))
+
+    legend_handles = [
+        mlines.Line2D([], [], color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG,
+                      linestyle="--", label="Perfect (CRPS=0)"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MAIN, label="Emulator"),
+    ]
+    for bname in baseline_names:
+        legend_handles.append(mlines.Line2D([], [], color=line_colors[bname],
+                                            lw=_PAPER_LW_MAIN, label=bname))
+    fig.legend(handles=legend_handles, ncol=len(legend_handles), loc="lower center",
+               bbox_to_anchor=(0.5, -0.03), fontsize=fontsize_legend, frameon=False,
+               handlelength=1.6, columnspacing=0.8, handletextpad=0.4)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=fontsize_title + 1, y=1.02)
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    return fig

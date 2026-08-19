@@ -136,3 +136,5 @@ dmypy.json
 
 # Mac stuff
 *.DS_Store
+._*
+

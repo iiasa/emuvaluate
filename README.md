@@ -1,615 +1,386 @@
-# emuvaluate — Climate emulator evaluation and validation pipeline
+# emuvaluate
 
-Evaluation toolkit for climate emulator ensembles. Provides preprocessing, scoring metrics, and diagnostic plots to compare emulated regional temperature outputs against CMIP6 simulations.
+Evaluate climate emulators against the simulations they are trying to emulate.
 
-## Status
+You give it a simulation ensemble and an emulator ensemble — plus, optionally,
+one or more *baseline* emulators to compare against — and it tells you where
+and how the emulator differs, as per-region or per-gridpoint error values and
+as publication-ready figures.
 
-- prototype: the project is just starting up and the code is all prototype
+The package works at two spatial scales, with the same API on both sides:
+
+| flavour      | unit           | data shape                                          |
+| ------------ | -------------- | --------------------------------------------------- |
+| **regional** | an AR6 region  | `(n_members, T, n_regions)` numpy arrays             |
+| **gridded**  | a gridpoint    | `xr.DataArray` with dims `(ensemble, time, lat, lon)`|
+
+Function names follow that split: `preprocess_regional` / `preprocess_gridded`,
+`build_error_data_regional` / `build_error_data_gridded`, `plot_map_regional` /
+`plot_map_gridded`. Functions that work on both take plain arrays and are
+named without a suffix (`plot_qq_scatter`, `plot_psd_curves`,
+`plot_temporal_correlation_curves`).
 
 ---
 
-## Installation
+## The three steps
 
-We do all our environment management using [uv](https://docs.astral.sh/uv/).
-To get started, you will need to make sure that uv is installed
-([instructions here](https://docs.astral.sh/uv/getting-started/installation/),
-we found that using uv's standalone installer was best on a Mac).
+Every figure in this package is produced the same way, and the boundaries
+between the steps are strict: **plots never compute scores, and metrics never
+preprocess data.**
 
-To create the virtual environment, run
-
-```sh
-uv sync
-uv run pre-commit install
+```
+preprocess  ─────►  build error data  ─────►  plot
+preprocessing.py     metrics.py               plots.py
 ```
 
-These steps are also captured in the `Makefile` so if you want a single
-command, you can instead simply run `make virtual-enviroment`.
+```python
+from emuvaluate.preprocessing import preprocess_regional, select_members
+from emuvaluate.metrics import build_error_data_regional
+from emuvaluate.plots import plot_map_regional, plot_timeseries_regional
 
-Having installed your virtual environment, you can now run commands in your
-virtual environment using
+# 1. preprocess — dict in, dict out, one entry per indicator
+sim = preprocess_regional({"tas": tas_raw, "pr": pr_raw}, yearly_average=True)
+emu = preprocess_regional({"tas": tas_emu_raw, "pr": pr_emu_raw}, yearly_average=True)
 
-```sh
-uv run <command>
+# 2. score every region, for every indicator and comparison, with one metric
+error_data = build_error_data_regional(
+    sim, emu, region_names,
+    metric="nmae",
+    baseline_emulations={"Pattern Scaling": ps},
+)
+
+# 3. plot — the figure functions only lay out what step 2 computed
+plot_map_regional(error_data, show_difference=True)
+plot_timeseries_regional(error_data, sim, emu, {"Pattern Scaling": ps}, years)
 ```
 
-For example, to run Python within the virtual environment, run
-
-```sh
-uv run python
-```
-
-As another example, to run a notebook server, run
-
-```sh
-uv run jupyter lab
-```
-
-Alternatively, to install directly with pip in editable mode:
-
-```bash
-git clone git@github.com:iiasa/emuvaluate.git
-cd emuvaluate
-pip install -e .
-```
+`error_data` is an `ErrorData` object: per-unit scores for every comparison and
+indicator, a shared colour-scale maximum, an optional Emulator-minus-baseline
+difference, and a full ranking of units from best to worst. Every plotting
+function reads from it — which is why swapping `metric="nmae"` for
+`metric="crps"` or `metric="psd_log_nmae"` changes what a map shows without
+touching the plotting call.
 
 ---
 
 ## Package structure
 
 ```
-emuvaluate/
-├── pyproject.toml
-├── notebooks/
-└── src/
-    └── emuvaluate/
-        ├── metrics.py           # scoring functions
-        ├── transforms.py        # preprocessing and smoothing functions
-        ├── plots.py             # diagnostic plots
-        ├── baseline_methods.py  # pattern scaling and other baselines
-        └── data_preparation.py  # data loading pipeline
+src/emuvaluate/
+├── data_preparation.py   load raw CMIP6 scenario files into ensemble arrays
+├── baseline_methods.py   the Pattern Scaling baseline emulator to compare against
+├── transforms.py         stateless array operations the rest builds on
+├── preprocessing.py      raw ensembles ──► scoring-ready arrays
+├── metrics.py            arrays ──► error values, packaged as ErrorData
+└── plots.py              ErrorData ──► figures
 ```
+
+### `data_preparation.py` — loading
+
+Reads CMIP6-ng scenario files off disk and turns them into the
+`(n_members, T, n_regions)` arrays everything else consumes.
+
+| function                            | what it does                                                     |
+| ----------------------------------- | ---------------------------------------------------------------- |
+| `load_scenarios(...)`               | the one entry point: model + indicators + scenarios ──► arrays    |
+| `process_scenarios(...)`            | per-scenario file handling, baseline subtraction, smoothing       |
+| `process_gmt_and_regions_into_array` | GMT + regional dataframes ──► the stacked numpy array            |
+| `filter_climate_files`, `get_all_files_`, `get_baseline_filename`, `parse_filename` | file discovery and matching |
+
+### `baseline_methods.py` — the reference emulator
+
+Pattern Scaling: regress each region/gridpoint on GMT, then predict.
+It's what "is the emulator actually better than the obvious thing?" is
+measured against.
+
+| function                                | scale    |
+| --------------------------------------- | -------- |
+| `fit_regional_regressions_monthly`      | regional |
+| `predict_pattern_scaling`               | regional |
+| `fit_gridpoint_regressions_monthly`     | gridded  |
+| `predict_pattern_scaling_gridded`       | gridded  |
+| `compute_gmt_area_weighted`             | both — area-weighted GMT from a gridded `tas` field |
+
+### `transforms.py` — stateless array operations
+
+`yearly_average`, `yearly_average_gridded`, `select_month`,
+`weighted_linear_smoothing` (locally-weighted-regression "forced response"
+smoothing). Used by `preprocessing.py`; occasionally useful directly.
+
+### `preprocessing.py` — getting data ready to score
+
+Two entry points, one per flavour, applying the same optional steps in the
+same order so regional and gridded results stay comparable:
+
+1. temporal aggregation (`yearly_average` **or** `month_selection`)
+2. `remove_ensemble_mean` — subtract the member-axis mean
+3. `smooth` — locally-weighted-regression smoothing, per member
+
+| function                          | notes                                                        |
+| --------------------------------- | ------------------------------------------------------------ |
+| `preprocess_regional(data, ...)`  | array or `{indicator: array}` in, same shape out              |
+| `preprocess_gridded(data, ...)`   | `xr.DataArray` or dict in, `GriddedArray` out; validates every entry against a reference grid via `ref_lat`/`ref_lon` |
+| `select_members(data, members)`   | slice the ensemble axis of anything — array, `GriddedArray`, or dict of either |
+| `scale_indicators(data, factors)` | multiply named indicators by a constant, e.g. `{"pr": 86400}` |
+| `GriddedArray`                    | flattened `(ensemble, time, n_grid)` values + the lat/lon metadata needed to fold per-gridpoint scores back into a map |
+
+`remove_ensemble_mean` removes whatever trend and seasonal cycle are common
+across ensemble members, leaving internal variability around the forced
+response. Apply it **before** splitting into subsets, so that a main ensemble
+and a "Simulations vs Simulations" baseline drawn from the same pool share one
+ensemble-mean reference:
+
+```python
+full = preprocess_regional(raw, remove_ensemble_mean=True)
+sim = select_members(full, slice(20, None))
+baseline = select_members(full, slice(0, 20))
+```
+
+### `metrics.py` — every number
+
+Four metric families. Pass any of these names as `metric=`; call
+`available_metrics()` for the live list.
+
+**Scalar** — one score straight from a unit's `(n_members, T)` pair:
+
+| name | meaning |
+| ---- | ------- |
+| `mae`, `mse`, `rmse`, `max_ae` | absolute / squared error |
+| `nmae`, `nmse`        | the same, normalised by the observed range / variance |
+| `mean_bias`, `sigma`  | difference in grand mean / standard deviation |
+| `crps`                | Continuous Ranked Probability Score, generalised to a multi-member "truth" — every simulation member is treated as an independent verification draw |
+
+**Quantile curves** — the per-unit quantity is a quantile curve, the score is
+the distance between the simulated and the emulated one:
+
+| name | meaning |
+| ---- | ------- |
+| `qq_mae`, `qq_nmae` | mean (normalised) absolute error between quantile curves |
+| `qq_ks`             | max difference — the Kolmogorov–Smirnov statistic |
+| `qq_tail_mae`       | restricted to the distribution tails |
+
+**Autocorrelation curves** — `temporal_corr_nmae`, the NMAE between the
+simulated and emulated lag-autocorrelation curves.
+
+**Power spectral density** — per-member Welch spectra, scored on the
+member-mean curve:
+
+| name | meaning |
+| ---- | ------- |
+| `psd_log_nmae`    | NMAE between the log10 spectra — weights every frequency band comparably. Usually the one you want. |
+| `psd_nmae`        | NMAE between the raw spectra — dominated by whichever frequencies carry the most power |
+| `psd_wasserstein` | earth-mover's distance — penalises power sitting at the *wrong* frequency |
+
+Builders, all of which return an `ErrorData`:
+
+| function | produces |
+| -------- | -------- |
+| `build_error_data_regional(sim, emulator, region_names, metric, ...)` | per-region scores |
+| `build_error_data_gridded(sim, emulator, metric, ...)`                | per-gridpoint scores |
+| `build_error_data_intervariable_correlation(...)`                     | per-unit error in the correlation *between two indicators* |
+| `build_error_data_intervariable_correlation_values(...)`              | the correlation magnitude itself, per data source, rather than the error |
+| `build_crps_timeseries_data_gridded(...)`                             | CRPS(t), averaged over gridpoints — a plain dict, not `ErrorData` |
+| `build_correlation_data(sim, pred, ...)`                              | across-region correlation matrices (regional only — a gridded one would be 10,000² ) |
+
+Key builder options:
+
+- **`baseline_emulations={name: {indicator: array}}`** — every baseline is
+  scored the same way as the emulator and gets its own row in the maps and its
+  own line in the timeseries.
+- **`ranking_strategy`** — `"emulator"` (default) or a baseline name. Decides
+  whose error orders the units, i.e. which ones the ranking plots call "best"
+  and "worst".
+- **`diff_baseline`** — which baseline `show_difference=True` subtracts.
+- **`n_lags` / `window`** (autocorrelation), **`quantiles`** (QQ),
+  **`psd_fs` / `psd_nperseg`** (PSD) — pass the same values to the matching
+  plotting function so the drawn curves match the scores.
+
+### `plots.py` — every figure
+
+Nothing here computes a score; each function is handed an `ErrorData` and
+decides how to lay it out.
+
+**Maps** — one column per indicator, one row per comparison:
+
+| function | notes |
+| -------- | ----- |
+| `plot_map_regional(error_data, ...)` | AR6 choropleth. `show_difference=True` returns a second figure with the Emulator-minus-baseline map. |
+| `plot_map_gridded(error_data, ...)`  | the data's native lat/lon grid. Also renders the CRPS map — build with `metric="crps"`; there is no separate CRPS-map function. |
+| `bar_plot_regional(error_data, ...)` | the same data as a grouped bar chart, all comparisons side by side per region |
+| `plot_error_matrix_regional(...)`    | **many models at once** — regions across the columns, one row per (model, indicator, experiment), error as colour. See below. |
+
+**Ranking grids** — one row per indicator, one column per selected unit:
+
+| function | what each panel shows |
+| -------- | --------------------- |
+| `plot_timeseries_regional` / `plot_timeseries_gridded` | Simulation and Emulator ensembles (members + median + 90 % CI) plus a dashed median per baseline |
+| `plot_qq_scatter`                    | simulated vs emulated quantiles, with a sim-vs-sim bootstrap band |
+| `plot_temporal_correlation_curves`   | autocorrelation against lag |
+| `plot_psd_curves`                    | spectral power against period (or frequency), with an inter-member percentile band |
+
+**Aggregates** — the unit axis is already collapsed:
+
+| function | notes |
+| -------- | ----- |
+| `plot_correlation_comparison` | across-region correlation matrices, sim / emu / difference (regional only) |
+| `plot_crps_timeseries_gridded` | spatially-averaged CRPS over time, one line per comparison |
 
 ---
 
-## Usage
+## Comparing several models: the error matrix
 
-### Data loading
-
-```python
-from emuvaluate.data_preparation import load_scenarios
-
-scenario_data = load_scenarios(
-    model='ACCESS-ESM1-5',
-    indicators=['tas'],
-    scenarios=['ssp245'],
-    model_path='/path/to/model/data',
-    monthly_flag=True,
-    use_smoothing=False,
-    train_pattern_scaling_name='ssp245',
-)
-```
-
-### Full diagnostic plot
+Every other function evaluates one emulated model at a time.
+`plot_error_matrix_regional` takes an `ErrorData` per model and lays them all
+out as a single heatmap — regions across the columns, one row per
+(model, indicator, experiment), error value as colour.
 
 ```python
-from emuvaluate.plots import plot_metric_extremes
+from emuvaluate.plots import plot_error_matrix_regional
 
-scores = plot_metric_extremes(
-    y_pred_ensemble=y_pred,   # (n_members, T, n_regions)
-    scenario_data=scenario,   # (n_members, T, n_regions)
-    metric='crps',
-    n_examples=5,
-    detrend=True,
-    detrend_tau=5,
-    deseasonalise=True,
-)
+error_data = {
+    model: build_error_data_regional(
+        sim[model], emu[model], region_list, metric="mae",
+        baseline_emulations={
+            "Simulations vs Simulations": sim_only[model],
+            "Pattern Scaling": ps[model],
+        },
+    )
+    for model in ("ACCESS-ESM1-5", "MPI-ESM1-2-LR", "MIROC6")
+}
+
+plot_error_matrix_regional(error_data)
 ```
 
-### QQ diagnostic plot
+```
+                                    ARO ARP ARS BOB CAF CAR ... WSB
+ACCESS-ESM1-5 · TAS · Emulator       ██  ██  ███ █   ██  ██      ██
+ACCESS-ESM1-5 · TAS · Sim vs Sim     █   █   ██  █   █   █       █
+ACCESS-ESM1-5 · TAS · Pattern Sc.    ███ ███ ███ ██  ███ ███     ███
+ACCESS-ESM1-5 · PR  · Emulator       ██  ███ █   ███ ██  █       ██
+   ⋮
+─────────────────────────────────────────────────────────────────────
+MPI-ESM1-2-LR · TAS · Emulator       ███ ███ ██  █   ███ ██      ███
+   ⋮
 
-```python
-from emuvaluate.plots import plot_qq_extremes
-
-results = plot_qq_extremes(
-    y_pred_ensemble=y_pred,
-    scenario_data=scenario,
-    metric='tail_mae',
-    n_examples=5,
-    yearly_average=True,
-    detrend=True,
-    detrend_tau=40,
-    save_path='qq_extremes.png',
-)
+        [ MAE (temperature) ▁▃▅▇ ]    [ MAE (precipitation) ▁▃▅▇ ]
 ```
 
-### Spatial correlation diagnostic
+The dict keys are free-form labels, so they can name anything that varies
+between runs — a model, a scenario, or both (`"ACCESS-ESM1-5 ssp245"`).
+"Experiment" is just what an `ErrorData` already carries: the Emulator plus
+every baseline you built it with, each getting its own row.
 
-```python
-from emuvaluate.plots import plot_spatial_correlations
+Every entry must cover the same regions and use the same metric, or the columns
+won't line up and the colours won't mean the same thing — both are checked and
+raise. A combination one model doesn't have (a baseline only some runs include)
+is drawn grey rather than dropped, so the grid stays rectangular and the gap is
+visible.
 
-results = plot_spatial_correlations(
-    y_pred_ensemble=y_pred,
-    scenario_data=scenario,
-    yearly_average=True,
-    detrend=True,
-    detrend_tau=40,
-    region_names=my_region_names,
-    save_path='spatial_corr.png',
-)
-# results contains: 'sim_corr', 'emu_corr', 'diff', 'mae', 'rmse'
-```
+Useful options:
 
-### Error metric bar chart with baselines
-
-```python
-from emuvaluate.plots import plot_error_metrics_bar
-from emuvaluate.baseline_methods import fit_regional_regressions_monthly, predict_pattern_scaling
-
-# Fit pattern scaling on training data
-fit = fit_regional_regressions_monthly(
-    global_series=gmt_train,
-    regional_series=regional_train,
-    monthly=True,
-    train_ramp_down=True,
-)
-
-# Predict on test GMT
-ps_emulation = predict_pattern_scaling(
-    fit=fit,
-    global_series=gmt_test,
-    monthly=True,
-    n_members=40,
-)
-
-# Plot emulator vs baseline
-results = plot_error_metrics_bar(
-    scenario_data=simulator_data,
-    y_pred_ensemble=emulator_data,
-    baseline_emulations={'Pattern Scaling': ps_emulation},
-    yearly_average=True,
-    metrics=['mae', 'rmse', 'max_ae'],
-    region_names=my_region_names,
-    save_path='error_metrics.png',
-)
-```
-
-### Ensemble timeseries comparison with baselines
-
-```python
-from emuvaluate.plots import plot_region_ensemble_extremes
-
-results = plot_region_ensemble_extremes(
-    scenario_data=simulator_data,
-    y_pred_ensemble=emulator_data,
-    baseline_emulations={'Pattern Scaling': ps_emulation},
-    n_examples=5,
-    metric='mae',
-    ranking_mode='difference',   # rank by how much emulator improves on baseline
-    yearly_average=True,
-    region_names=my_region_names,
-    save_path='ensemble_extremes.png',
-)
-```
-
-### GMT vs regional scatter plots
-
-```python
-from emuvaluate.plots import plot_gmt_vs_regional, plot_gmt_vs_regional_linearity_extremes
-from emuvaluate.transforms import weighted_linear_smoothing, yearly_average
-
-gmt_smooth       = weighted_linear_smoothing(yearly_average(gmt_data[0, :]))
-scenario_smooth  = weighted_linear_smoothing(yearly_average(scenario_data))
-emulation_smooth = weighted_linear_smoothing(yearly_average(y_pred_ensemble))
-
-# Plot specific or random regions and samples
-plot_gmt_vs_regional(
-    gmt=gmt_smooth,
-    regional_data={
-        'Simulation':      scenario_smooth,
-        'Emulation':       emulation_smooth,
-        'Pattern Scaling': weighted_linear_smoothing(yearly_average(ps_emulation)),
-    },
-    n_random=5,
-    region_names=my_region_names,
-)
-
-# Plot most and least linear regions
-results = plot_gmt_vs_regional_linearity_extremes(
-    gmt=gmt_smooth,
-    regional_data={
-        'Simulation':      scenario_smooth,
-        'Emulation':       emulation_smooth,
-        'Pattern Scaling': weighted_linear_smoothing(yearly_average(ps_emulation)),
-    },
-    n_examples=5,
-    n_random_samples=5,
-    region_names=my_region_names,
-    save_path='linearity.png',
-)
-```
-
-### GMT phase detection and splitting
-
-```python
-from emuvaluate.transforms import find_phase_split_points, split_at_indices
-from emuvaluate.plots import plot_gmt_phases
-
-# Find split points that best match the requested phase sequence
-split_points = find_phase_split_points(
-    gmt=gmt,
-    phases=['stable', 'ramp-up', 'ramp-down', 'stable'],
-    tau=20,
-)
-
-# Visualise the detected phases
-plot_gmt_phases(
-    gmt=gmt,
-    split_points=split_points,
-    phases=['stable', 'ramp-up', 'ramp-down', 'stable'],
-    save_path='gmt_phases.png',
-)
-
-# Split data along T at those points
-segments = split_at_indices(scenario_data, split_points)
-# segments[0] covers the first stable phase, segments[1] the ramp-up, etc.
-```
-
-### Smoothing
-
-```python
-from emuvaluate.transforms import weighted_linear_smoothing
-
-# 1-D GMT timeseries
-gmt_smooth = weighted_linear_smoothing(gmt, tau=20)
-
-# 2-D array (T, n_regions)
-regional_smooth = weighted_linear_smoothing(regional_data, tau=20)
-
-# Full ensemble array (n_members, T, n_regions)
-data_smooth = weighted_linear_smoothing(scenario_data, tau=20)
-
-# Monthly data — smooth each calendar month independently
-data_smooth_monthly = weighted_linear_smoothing(scenario_data, tau=20, monthly=True)
-```
-
-### Using components individually
-
-```python
-from emuvaluate.transforms import preprocess, detrend_gaussian, deseasonalise
-from emuvaluate.metrics import compute_metric_all_regions, crps_score
-from emuvaluate.plots import rank_regions
-
-# Preprocess
-data_clean = deseasonalise(detrend_gaussian(data, tau=20))
-
-# Score all regions
-scores = compute_metric_all_regions(obs, pred, metric='crps')
-
-# Rank
-best, worst = rank_regions(scores, n_examples=5)
-```
+| option | effect |
+| ------ | ------ |
+| `row_order` | any permutation of `("model", "indicator", "comparison")`, outermost first. `("indicator", "comparison", "model")` groups all models of one experiment together instead. |
+| `models`, `indicators`, `comparisons`, `regions` | restrict and/or reorder each axis |
+| `normalise` | `"indicator"` (default) — one scale and colourbar per indicator, so K and mm/day never share a colour. `"global"` for one scale; `"row"` to scale each row to its own max and compare error *shapes*. |
+| `vmin`, `vmax` | scalar, `{indicator: value}`, or `"auto"`. `vmin` defaults to `0` like the maps; set `vmin="auto"` when every row looks the same flat colour and you want the range spent on the differences between rows. |
+| `sort_regions` | `"mean"` / `"max"` to put the worst regions first, or a callable. Default keeps the region order stable across figures. |
+| `show_values` | write the number in each cell — readable up to about a dozen columns |
 
 ---
 
-## API reference
+## Working with any number of indicators
 
-### `emuvaluate.metrics`
+Everything is indicator-generic. The `{indicator: array}` dict you pass in
+decides how many columns a map has and how many rows a ranking grid has, in
+the order you give them. The default is two indicators named `tas` and `pr`,
+which are labelled and given units automatically.
 
-#### Ensemble scoring metrics
-Accept arrays of shape `(n_members, T)` and return a single float (lower = better).
+```python
+# one indicator
+build_error_data_regional({"tas": sim}, {"tas": emu}, regions)
 
-| Function | Description |
-|---|---|
-| `crps_score(obs, pred)` | Mean Continuous Ranked Probability Score over all timesteps. |
-| `mean_score(obs, pred)` | Absolute difference between ensemble grand means. |
-| `sigma_score(obs, pred)` | Absolute difference between ensemble standard deviations. |
-| `psd_score(obs, pred)` | Wasserstein distance between mean power spectral densities (Welch method). |
-| `compute_metric_all_regions(obs, pred, metric)` | Applies a named metric to every region. Returns `dict[region_idx → score]`. |
+# three, one of them custom-named
+build_error_data_regional(
+    {"tas": a, "pr": b, "hurs": c},
+    {"tas": d, "pr": e, "hurs": f},
+    regions,
+    indicator_labels={"hurs": "Relative humidity (HURS)"},
+    indicator_units={"hurs": "%"},
+)
 
-Available metric names: `'crps'`, `'mean'`, `'sigma'`, `'psd'`.
+# reorder or subset without rebuilding the dicts
+build_error_data_regional(sim, emu, regions, indicators=["pr", "tas"])
+```
 
-#### Error metrics
-Accept arrays of shape `(n_members, T)` and return a single float (lower = better).
-
-| Function | Description |
-|---|---|
-| `mae_score(obs, pred)` | Mean Absolute Error between ensemble means. |
-| `rmse_score(obs, pred)` | Root Mean Squared Error between ensemble means. |
-| `max_ae_score(obs, pred)` | Maximum Absolute Error between ensemble means. |
-| `mse_score(obs, pred)` | Mean Squared Error between ensemble means. |
-| `nmae_score(obs, pred)` | Normalised MAE — divided by the range of the observed ensemble mean. |
-| `nmse_score(obs, pred)` | Normalised MSE — divided by the variance of the observed ensemble mean. |
-
-Available error metric names: `'mae'`, `'rmse'`, `'max_ae'`, `'mse'`, `'nmae'`, `'nmse'`.
-
-#### QQ metrics
-Compare quantile distributions between simulations and emulations.
-
-| Function | Description |
-|---|---|
-| `qq_mae(obs_q, pred_q)` | Mean Absolute Error between quantiles. |
-| `qq_nmae(obs_q, pred_q)` | Normalised MAE — divided by the range of observed quantiles. |
-| `qq_max_ae(obs_q, pred_q)` | Maximum Absolute Error between quantiles. |
-| `qq_mse(obs_q, pred_q)` | Mean Squared Error between quantiles. |
-| `qq_nmse(obs_q, pred_q)` | Normalised MSE — divided by variance of observed quantiles. |
-| `qq_ks(obs_q, pred_q)` | Kolmogorov-Smirnov statistic. |
-| `qq_tail_mae(obs_q, pred_q, tail_frac=0.1)` | MAE restricted to the upper and lower tails of the quantile grid. |
-| `compute_qq_scores_all_regions(obs, pred, metric, quantiles)` | Applies a named QQ metric to every region. Returns `(scores, obs_qq, pred_qq)`. |
-
-Available QQ metric names: `'mae'`, `'nmae'`, `'max_ae'`, `'mse'`, `'nmse'`, `'ks'`, `'tail_mae'`.
-
-#### Spatial correlation metrics
-
-| Function | Description |
-|---|---|
-| `spatial_correlation_matrix(data)` | Computes mean spatial correlation matrix `(n_regions, n_regions)` across ensemble members. |
-| `spatial_correlation_scores(obs, pred)` | Returns dict with `sim_corr`, `emu_corr`, `diff`, `mae`, `rmse`. |
-
-#### Linearity metric
-
-| Function | Description |
-|---|---|
-| `linearity_score(obs, gmt)` | R² of a linear regression of regional values on GMT. Higher = more linear. Accepts `obs` of shape `(n_members, T)` and `gmt` of shape `(n_members, T)` or `(T,)`. |
+Any key that isn't `tas` or `pr` is labelled by its uppercased name and gets no
+unit string unless you supply one.
 
 ---
 
-### `emuvaluate.transforms`
+## Choosing which units the ranking plots show
 
-#### Aggregation and selection
+Every ranking plot takes `selection`, in three forms:
 
-| Function | Accepted shapes | Description |
-|---|---|---|
-| `yearly_average(data)` | `(T,)`, `(T, n_regions)`, `(n_members, T, n_regions)` | Collapses 12 consecutive monthly timesteps into annual means. Trailing incomplete years are dropped. |
-| `select_month(data, month)` | `(n_members, T, n_regions)` | Retains only timesteps for a given calendar month (1–12). |
-| `deseasonalise(data, period=12)` | `(n_members, T, n_regions)` | Subtracts the mean seasonal cycle per member and region. |
-| `detrend_gaussian(data, tau=20)` | `(n_members, T, n_regions)` | Removes a Gaussian-smoothed trend per member and region. |
-| `preprocess(data, ...)` | `(n_members, T, n_regions)` | Convenience wrapper: aggregation → deseasonalise → detrend. |
+```python
+# default — best, median and worst unit by error_data.ranking
+plot_timeseries_regional(ed, sim, emu, baselines, years)
 
-`preprocess` keyword arguments:
+# 1-based ranks: the four best regions
+plot_psd_curves(ed, sim, emu, nperseg=256, selection=[1, 2, 3, 4])
 
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `apply_yearly_average` | bool | False | Collapse to annual means |
-| `month_selection` | int or None | None | Keep one calendar month only |
-| `apply_deseasonalise` | bool | False | Remove seasonal cycle |
-| `apply_detrend` | bool | False | Remove Gaussian trend |
-| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
+# named regions, in the order given
+plot_timeseries_regional(ed, sim, emu, baselines, years,
+                         selection=["SOO", "MED", "WAF"])
 
-`apply_yearly_average` and `month_selection` are mutually exclusive.
+# gridded: (lat, lon) pairs, matched to the nearest gridpoint
+plot_timeseries_gridded(ed, sim, emu, baselines, years,
+                        selection=[(0.0, 0.0), (50.0, 10.0)])
+```
 
-#### Smoothing
+With an explicit selection each panel title also reports where that unit falls
+in the ranking, so you can still see whether you picked a good one.
 
-| Function | Accepted shapes | Description |
-|---|---|---|
-| `weighted_linear_smoothing(data, tau=20, monthly=False)` | `(T,)`, `(T, n_regions)`, `(n_members, T, n_regions)` | Local weighted regression smoothing along T. If `monthly=True`, each calendar month is smoothed independently across years (T must be divisible by 12). |
+## Locking the y-axis across a row
 
-#### Phase detection and splitting
+`share_y_per_row=False` is the default — each panel scales to its own data.
+Set it to `True` to give every panel in a row the same y-limits, which makes
+the columns directly comparable at a glance:
 
-| Function | Description |
-|---|---|
-| `split_at_indices(data, split_points)` | Splits `(n_members, T, n_regions)` along T at the given indices. Returns `len(split_points) + 1` arrays. |
-| `find_phase_split_points(gmt, phases, ...)` | Finds split points that best divide a GMT timeseries into a requested sequence of phases (`'ramp-up'`, `'ramp-down'`, `'stable'`). GMT is smoothed before detection. Always returns `len(phases) - 1` split points. |
+```python
+plot_timeseries_regional(ed, sim, emu, baselines, years, share_y_per_row=True)
+```
 
-`find_phase_split_points` keyword arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `tau` | float | 20 | Smoothing bandwidth |
-| `smooth` | bool | True | Smooth GMT before phase detection |
-| `stable_window` | int | 30 | Timesteps over which to assess stability |
-| `stable_threshold` | float | 0.1 | Max GMT change over `stable_window` to count as stable |
-| `min_phase_length` | int | 10 | Minimum timesteps for a valid phase segment |
-| `window_size` | int or None | None | Rolling window size for ramp detection (defaults to T // 3) |
+Available on `plot_timeseries_regional`, `plot_timeseries_gridded`,
+`plot_qq_scatter`, `plot_temporal_correlation_curves` and `plot_psd_curves`.
+`plot_crps_timeseries_gridded` has the equivalent `share_y` (it has no columns
+to share across, only rows).
 
 ---
 
-### `emuvaluate.plots`
+## Notebooks
 
-| Function | Description |
-|---|---|
-| `plot_metric_extremes(...)` | Scores all regions by a chosen metric and plots the best and worst examples side by side. |
-| `plot_qq_extremes(...)` | Scores all regions by a QQ metric and plots QQ scatter and quantile curves for best and worst regions. |
-| `plot_spatial_correlations(...)` | Plots spatial correlation matrices for simulations and emulations, plus their difference. |
-| `plot_error_metrics_bar(...)` | Per-region error metrics as grouped bar charts, comparing emulator against one or more baselines. |
-| `plot_region_ensemble_extremes(...)` | Plots best and worst regions with all methods overlaid (simulation, emulator, baselines), ranked by a chosen error metric. |
-| `plot_gmt_vs_regional(...)` | Scatter plot of regional values vs GMT for multiple data sources and a chosen set of regions and samples. |
-| `plot_gmt_vs_regional_linearity_extremes(...)` | Ranks regions by GMT–regional linearity (R²) and plots the most and least linear using `plot_gmt_vs_regional`. |
-| `plot_gmt_phases(...)` | Plots a GMT timeseries with phase splits highlighted as shaded bands, with raw and smoothed GMT overlaid. |
-| `plot_random_timeseries(...)` | Plots randomly sampled (ensemble, region) pairs: true vs predicted. |
-| `rank_regions(metric_scores, n_examples=5)` | Splits a scores dict into the `n_examples` best and worst region pairs. |
+| notebook | what it produces |
+| -------- | ---------------- |
+| `notebooks/paper.py` | the regional paper figures: error maps, timeseries, QQ variability, spatial correlations, intervariable correlation, autocorrelation curves, PSD |
+| `notebooks/paper-MESH.py` | the gridded counterparts, plus the CRPS map and CRPS timeseries |
+| `notebooks/MischMasch.py` | the regional figures run against the MischMasch emulator's output |
 
-`plot_metric_extremes` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `y_pred_ensemble` | ndarray | — | Emulated ensemble `(n_members, T, n_regions)` |
-| `scenario_data` | ndarray | — | Ground-truth ensemble `(n_members, T, n_regions)` |
-| `n_examples` | int | 5 | Number of best/worst regions to show |
-| `metric` | str | `'crps'` | One of `'crps'`, `'mean'`, `'sigma'`, `'psd'` |
-| `yearly_average` | bool | False | Aggregate to annual before scoring |
-| `month_selection` | int or None | None | Restrict to one calendar month |
-| `detrend` | bool | False | Remove Gaussian trend before scoring |
-| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
-| `deseasonalise` | bool | False | Remove seasonal cycle before scoring |
-| `save_path` | str or None | None | Save figure to this path |
-
-`plot_error_metrics_bar` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `scenario_data` | ndarray | — | Ground-truth ensemble `(n_members, T, n_regions)` |
-| `y_pred_ensemble` | ndarray | — | Emulated ensemble `(n_members, T, n_regions)` |
-| `baseline_emulations` | dict or None | None | Dict of `name → (n_members, T, n_regions)` |
-| `metrics` | list | `['mae','rmse','max_ae']` | Error metrics to plot |
-| `yearly_average` | bool | False | Aggregate to annual before scoring |
-| `month_selection` | int or None | None | Restrict to one calendar month |
-| `detrend` | bool | False | Remove Gaussian trend |
-| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
-| `deseasonalise` | bool | False | Remove seasonal cycle |
-| `region_names` | list or None | None | Region label strings |
-| `save_path` | str or None | None | Save figure to this path |
-
-`plot_region_ensemble_extremes` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `scenario_data` | ndarray | — | Ground-truth ensemble `(n_members, T, n_regions)` |
-| `y_pred_ensemble` | ndarray | — | Emulated ensemble `(n_members, T, n_regions)` |
-| `baseline_emulations` | dict or None | None | Dict of `name → (n_members, T, n_regions)` |
-| `n_examples` | int | 5 | Number of best/worst regions to show |
-| `metric` | str | `'mae'` | Error metric key from `ERROR_METRIC_REGISTRY` |
-| `ranking_mode` | str | `'emulator'` | One of `'emulator'`, `'baseline'`, `'difference'` |
-| `yearly_average` | bool | False | Aggregate to annual before scoring |
-| `month_selection` | int or None | None | Restrict to one calendar month |
-| `detrend` | bool | False | Remove Gaussian trend |
-| `detrend_tau` | float | 20 | Smoothing sigma for detrending |
-| `deseasonalise` | bool | False | Remove seasonal cycle |
-| `region_names` | list or None | None | Region label strings |
-| `save_path` | str or None | None | Save figure to this path |
-
-`plot_gmt_vs_regional` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `gmt` | ndarray | — | GMT timeseries `(T,)` or `(n_samples, T)` |
-| `regional_data` | dict | — | Dict of `name → (n_samples, T, n_regions)` or `(T, n_regions)` |
-| `region_indices` | list or None | None | Region indices to plot; if None uses `n_random` |
-| `sample_indices` | list or None | None | Sample indices to plot; if None uses `n_random` |
-| `n_random` | int or None | None | Number of random regions/samples to draw if indices not given |
-| `region_names` | list or None | None | Region label strings |
-| `save_path` | str or None | None | Save figure to this path |
-
-`plot_gmt_vs_regional_linearity_extremes` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `gmt` | ndarray | — | GMT timeseries `(T,)` or `(n_samples, T)` |
-| `regional_data` | dict | — | Dict of `name → (n_samples, T, n_regions)` or `(T, n_regions)`; linearity ranked on first entry |
-| `n_examples` | int | 5 | Number of most/least linear regions to show |
-| `sample_indices` | list or None | None | Fixed sample indices; if None draws `n_random_samples` |
-| `n_random_samples` | int | 5 | Number of random samples if `sample_indices` not given |
-| `region_names` | list or None | None | Region label strings |
-| `save_path` | str or None | None | Base path — `_most_linear` / `_least_linear` appended before extension |
-
-`plot_gmt_phases` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `gmt` | ndarray | — | GMT timeseries `(T,)` |
-| `split_points` | list | — | Split indices along T |
-| `phases` | list or None | None | Phase label strings, length `len(split_points) + 1` |
-| `tau` | float | 20 | Smoothing bandwidth for overlay |
-| `smooth` | bool | True | Whether to overlay the smoothed GMT |
-| `title` | str or None | None | Optional figure title |
-| `save_path` | str or None | None | Save figure to this path |
+They are jupytext-paired (`ipynb,py:percent`), so the `.py` files are the
+source of truth and `jupytext --sync notebooks/*.py` regenerates the `.ipynb`.
 
 ---
 
-### `emuvaluate.baseline_methods`
+## Installation
 
-| Function | Description |
-|---|---|
-| `fit_regional_regressions(global_series, regional_series, ...)` | Fits per-region linear regressions against GMT with optional ramp-down correction. |
-| `fit_regional_regressions_monthly(global_series, regional_series, ...)` | Fits regressions stratified by calendar month. Returns a list of 12 dicts (monthly) or a single dict (annual). |
-| `predict_pattern_scaling(fit, global_series, ...)` | Applies fitted coefficients to a GMT series. Returns `(n_members, T, n_regions)`. |
+```bash
+pip install -e .
+```
 
-`fit_regional_regressions_monthly` arguments:
+Needs Python ≥ 3.9. The heavier dependencies are `cartopy` and `regionmask`
+(map drawing), `statsmodels` (autocorrelation), `scipy` (Welch spectra,
+Wasserstein distance) and `xarray` (gridded data).
 
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `global_series` | ndarray | — | GMT timeseries `(T,)` |
-| `regional_series` | ndarray | — | Regional indicators `(T, n_regions)` |
-| `train_ramp_down` | bool | False | Fit a separate correction for the ramp-down phase |
-| `monthly` | bool | True | Stratify by calendar month; set False for annual data |
-
-`predict_pattern_scaling` arguments:
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `fit` | list or dict | — | Output of `fit_regional_regressions_monthly` |
-| `global_series` | ndarray | — | GMT timeseries to emulate `(T,)` |
-| `monthly` | bool | True | Must match how `fit` was produced |
-| `n_members` | int | 1 | Number of output ensemble members (deterministic — all identical) |
-
----
-
-### `emuvaluate.data_preparation`
-
-| Function | Description |
-|---|---|
-| `load_scenarios(model, indicators, scenarios, model_path, ...)` | Full pipeline: finds files, loads CSVs, computes anomalies relative to baseline, optionally applies pattern scaling. Returns a list of arrays, one per scenario. |
-| `prepare_scenario_data(...)` | Single-indicator version of `load_scenarios`. |
-| `process_scenarios(...)` | Loads and aligns one baseline/scenario CSV pair and returns `(gmt_df, regional_df)`. |
-
----
-
-## Development
-
-Install and run instructions are the same as the above (this is a simple
-repository, without tests etc. so there are no development-only dependencies).
-
-### Contributing
-
-This is a very thin repository. There aren't any strict guidelines for
-contributing, partly because we don't know what we're trying to achieve (we're
-just exploring). If you would like to contribute, it is best to raise an issue
-to discuss what you want to do (without a discussion, we can't guarantee that
-any contribution can actually be used).
-
-### Repository structure
-
-The repository is very basic. It imposes no structure on you so you can layout
-your Python files, notebooks etc. in any way you wish. We do have a basic
-`Makefile` which captures key commands in one place (for more thoughts on why
-this makes sense, see
-[general principles: automation](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/general-principles/automation.md)).
-For an introduction to `make`, see
-[this introduction from Software Carpentry](https://swcarpentry.github.io/make-novice/).
-Having said this, if you're not interested in `make`, you can just copy the
-commands out of the `Makefile` by hand and you will be 90% as happy for a
-simple repository like this.
-
-### Tools
-
-In this repository, we use the following tools:
-
-- git for version-control (for more on version control, see
-  [general principles: version control](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/theory/version-control.md))
-    - for these purposes, git is a great version-control system so we don't
-      complicate things any further. For an introduction to Git, see
-      [this introduction from Software Carpentry](http://swcarpentry.github.io/git-novice/).
-- [uv](https://docs.astral.sh/uv/) for environment management
-  (for more on environment management, see
-  [general principles: environment management](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/theory/environment-management.md))
-    - there are lots of environment management systems.
-      uv works well in our experience.
-    - we track the `uv.lock` file so that the environment
-      is completely reproducible on other machines or by other people
-      (e.g. if you want a colleague to take a look at what you've done)
-- [pre-commit](https://pre-commit.com/) with some very basic settings to get some
-  easy wins in terms of maintenance, specifically:
-    - code formatting with [ruff](https://docs.astral.sh/ruff/formatter/)
-    - basic file checks (removing unneeded whitespace, not committing large
-      files etc.)
-    - (for more thoughts on the usefulness of pre-commit, see
-      [general principles: automation](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/general-principles/automation.md))
-    - track your notebooks using
-      [jupytext](https://jupytext.readthedocs.io/en/latest/index.html)
-      (for more thoughts on the usefulness of Jupytext, see
-      [tips and tricks: Jupytext](https://gitlab.com/znicholls/mullet-rse/-/blob/main/book/tips-and-tricks/managing-notebooks-jupytext.md))
-        - this avoids nasty merge conflicts and incomprehensible diffs
-
----
-
-## Authors
-
-Annika Högner, Verena Kain, Tessa Möller, Zebedee Nicholls, Niklas Schwind, Marco Zecchetto — IIASA
-
----
-
-## Original template
-
-This project was generated from this template:
-[basic python repository](https://gitlab.com/openscm/copier-basic-python-repository).
-[copier](https://copier.readthedocs.io/en/stable/) is used to manage and
-distribute this template.
+`regionmask` downloads the IPCC AR6 reference-region shapefile on first use,
+and `cartopy` downloads Natural Earth coastlines — so the first map you draw
+needs network access.
