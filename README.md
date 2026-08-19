@@ -22,6 +22,28 @@ named without a suffix (`plot_qq_scatter`, `plot_psd_curves`,
 
 ---
 
+## Installation
+
+```bash
+pip install -e .
+```
+
+Needs Python ≥ 3.9. The heavier dependencies are `cartopy` and `regionmask`
+(map drawing), `statsmodels` (autocorrelation), `scipy` (Welch spectra,
+Wasserstein distance) and `xarray` (gridded data).
+
+`regionmask` downloads the IPCC AR6 reference-region shapefile on first use,
+and `cartopy` downloads Natural Earth coastlines — so the first map you draw
+needs network access.
+
+If you want to use the notebooks run: 
+
+```bash
+jupytext --sync notebooks/*.py
+```
+
+---
+
 ## The three steps
 
 Every figure in this package is produced the same way, and the boundaries
@@ -369,18 +391,3 @@ to share across, only rows).
 They are jupytext-paired (`ipynb,py:percent`), so the `.py` files are the
 source of truth and `jupytext --sync notebooks/*.py` regenerates the `.ipynb`.
 
----
-
-## Installation
-
-```bash
-pip install -e .
-```
-
-Needs Python ≥ 3.9. The heavier dependencies are `cartopy` and `regionmask`
-(map drawing), `statsmodels` (autocorrelation), `scipy` (Welch spectra,
-Wasserstein distance) and `xarray` (gridded data).
-
-`regionmask` downloads the IPCC AR6 reference-region shapefile on first use,
-and `cartopy` downloads Natural Earth coastlines — so the first map you draw
-needs network access.
