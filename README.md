@@ -272,21 +272,6 @@ error_data = {
 
 plot_error_matrix_regional(error_data)
 ```
-
-```
-                                    ARO ARP ARS BOB CAF CAR ... WSB
-ACCESS-ESM1-5 · TAS · Emulator       ██  ██  ███ █   ██  ██      ██
-ACCESS-ESM1-5 · TAS · Sim vs Sim     █   █   ██  █   █   █       █
-ACCESS-ESM1-5 · TAS · Pattern Sc.    ███ ███ ███ ██  ███ ███     ███
-ACCESS-ESM1-5 · PR  · Emulator       ██  ███ █   ███ ██  █       ██
-   ⋮
-─────────────────────────────────────────────────────────────────────
-MPI-ESM1-2-LR · TAS · Emulator       ███ ███ ██  █   ███ ██      ███
-   ⋮
-
-        [ MAE (temperature) ▁▃▅▇ ]    [ MAE (precipitation) ▁▃▅▇ ]
-```
-
 The dict keys are free-form labels, so they can name anything that varies
 between runs — a model, a scenario, or both (`"ACCESS-ESM1-5 ssp245"`).
 "Experiment" is just what an `ErrorData` already carries: the Emulator plus
@@ -384,9 +369,8 @@ to share across, only rows).
 
 | notebook | what it produces |
 | -------- | ---------------- |
-| `notebooks/paper.py` | the regional paper figures: error maps, timeseries, QQ variability, spatial correlations, intervariable correlation, autocorrelation curves, PSD |
-| `notebooks/paper-MESH.py` | the gridded counterparts, plus the CRPS map and CRPS timeseries |
-| `notebooks/MischMasch.py` | the regional figures run against the MischMasch emulator's output |
+| `notebooks/paper-MESH.py` | the gridded evaluations of MESH |
+| `notebooks/paper-SCALES.py` | the regional evaluations of SCALES |
 
 They are jupytext-paired (`ipynb,py:percent`), so the `.py` files are the
 source of truth and `jupytext --sync notebooks/*.py` regenerates the `.ipynb`.
