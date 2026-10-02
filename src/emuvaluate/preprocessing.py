@@ -345,3 +345,75 @@ def scale_indicators(data: dict, factors: dict[str, float]):
         return np.asarray(value) * factor
 
     return {k: _scaled(v, factors[k]) if k in factors else v for k, v in data.items()}
+
+def ensemble_mean_regional(data):
+    """
+    Collapse the ensemble (member) axis to its mean, keeping it as one member.
+ 
+    ``(n_members, T, n_units)`` -> ``(1, T, n_units)``, or the same for every
+    entry of a ``{indicator: array}`` dict.
+ 
+    Keeping the member axis rather than dropping it means the result is still
+    the shape every builder and plotting function expects — it just describes
+    a one-member "ensemble" that happens to be the mean. So
+    ``metric="mae"`` between two of these is the MAE between the two ensemble
+    means, and `plots.plot_timeseries_regional` draws one line per source
+    instead of a spread:
+ 
+        mean_sim = ensemble_mean(sim)
+        mean_emu = ensemble_mean(emu)
+        ed = build_error_data_regional(mean_sim, mean_emu, region_names, metric="mae")
+ 
+    Use this instead of ``preprocess_regional(..., smooth=True)`` when you
+    want the forced response as the ensemble mean rather than as a
+    locally-smoothed per-member curve.
+ 
+    Parameters
+    ----------
+    data : array, or ``{indicator: array}``
+ 
+    Returns
+    -------
+    The same container type as *data*.
+    """
+    if isinstance(data, dict):
+        return {k: ensemble_mean_regional(v) for k, v in data.items()}
+    return np.asarray(data).mean(axis=0, keepdims=True)
+ 
+ 
+def ensemble_mean_gridded(data):
+    """
+    Gridded analogue of `ensemble_mean`: collapse the member axis of a
+    `GriddedArray` to its mean, keeping it as one member and preserving the
+    lat/lon metadata.
+ 
+    Accepts a `GriddedArray` or a ``{indicator: GriddedArray}`` dict — the
+    shape `preprocess_gridded` returns — so it drops straight into the gridded
+    pipeline:
+ 
+        sim = preprocess_gridded({"tas": ..., "pr": ...}, yearly_average=True)
+        emu = preprocess_gridded({"tas": ..., "pr": ...}, yearly_average=True, **REF)
+        ed = build_error_data_gridded(
+            ensemble_mean_gridded(sim), ensemble_mean_gridded(emu), metric="mae",
+        )
+ 
+    Plain arrays are passed through to `ensemble_mean`, so this also works on
+    ``mesh_array.values`` if that is what you have in hand.
+ 
+    Parameters
+    ----------
+    data : GriddedArray, array, or ``{indicator: ...}`` dict of either
+ 
+    Returns
+    -------
+    The same container type as *data*.
+    """
+    if isinstance(data, dict):
+        return {k: ensemble_mean_gridded(v) for k, v in data.items()}
+    if isinstance(data, GriddedArray):
+        return GriddedArray(
+            values=data.values.mean(axis=0, keepdims=True),
+            lat=data.lat,
+            lon=data.lon,
+        )
+    return ensemble_mean_regional(data)

@@ -246,5 +246,17 @@ def weighted_linear_smoothing(data: np.ndarray, tau: float = 20, monthly: bool =
 
 
 
+def ensemble_mean_regional(data):
+    """Collapse the member axis to the ensemble mean, keeping it as one member.
+
+    {indicator: (n_members, T, n_regions)} -> {indicator: (1, T, n_regions)}
+
+    Keeping the axis (rather than dropping it) means the result is still the
+    shape every builder and plotting function expects — it just describes a
+    one-member "ensemble" that is the mean. MAE between two of these is
+    therefore the MAE between the two ensemble means, and the timeseries plot
+    draws one line per source instead of a spread.
+    """
+    return {k: np.asarray(v).mean(axis=0, keepdims=True) for k, v in data.items()}
 
 

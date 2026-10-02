@@ -76,6 +76,7 @@ __all__ = [
     "plot_correlation_comparison",
     "plot_crps_timeseries_gridded",
     "resolve_selection",
+    "plot_spatial_correlation_curves_gridded",
 ]
 
 
@@ -1839,3 +1840,113 @@ def plot_crps_timeseries_gridded(
     if save_path:
         fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
     return fig
+
+def plot_spatial_correlation_curves_gridded(
+    error_data: ErrorData,
+    curve_data: dict,
+    *,
+    show_spread: bool = True,
+    x_unit: str = "km",
+    selection=None,
+    share_y_per_row: bool = False,
+    panel_width: float = 3.4,
+    panel_height: float = 2.2,
+    fontsize_title: int = 7,
+    fontsize_ax: int = 6,
+    fontsize_legend: int = 6,
+    suptitle: str | None = None,
+    save_path: str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """
+    Correlation-vs-distance curves for selected gridpoints — great-circle
+    distance on the x-axis, mean correlation with the gridpoints at that
+    distance on the y-axis — one row per indicator.
+ 
+    The companion figure to a ``metric="spatial_corr_nmae"`` map: the map says
+    *where* the emulator gets the spatial structure wrong, this says *how*. An
+    emulator that draws gridpoints too independently gives a curve that decays
+    to zero faster than the simulation's; one that over-smooths stays high too
+    far out.
+ 
+    Parameters
+    ----------
+    error_data : from `metrics.build_error_data_spatial_correlation_gridded` —
+        supplies the ranking, the per-gridpoint scores in the panel titles, and
+        the indicator list.
+    curve_data : the matching dict from
+        `metrics.build_spatial_correlation_curve_data_gridded` — the curves
+        themselves. Both come from the same call chain, so they are already
+        consistent; nothing is recomputed here.
+    show_spread : shade ±1 standard deviation of the individual pairwise
+        correlations inside each distance bin, around each curve. This is the
+        scatter across gridpoint *pairs*, not across ensemble members — it
+        shows whether a gap between two curves is larger than the variation
+        among the pairs that went into them.
+    x_unit : "km" (default) or "1000 km", purely a display scaling.
+    selection : which gridpoints to show — ``None`` for best / median / worst,
+        a list of 1-based ranks, or a list of ``(lat, lon)`` pairs. See
+        `resolve_selection`.
+    share_y_per_row : give every panel in a row the same y-limits (default
+        False). Often worth setting True here, since correlation is already on
+        a common scale.
+    (remaining parameters control figure geometry/cosmetics)
+ 
+    Returns
+    -------
+    matplotlib Figure
+    """
+    if x_unit not in ("km", "1000 km"):
+        raise ValueError("x_unit must be 'km' or '1000 km'")
+    scale = 1.0 if x_unit == "km" else 1e-3
+    x = np.asarray(curve_data["bin_centers"]) * scale
+ 
+    curves = curve_data["curves"]
+    spread = curve_data["spread"]
+    baselines = [c for c in error_data.comparisons if c != "Emulator"]
+ 
+    def _line(ax, source, uidx, indicator, color, dashed):
+        y = curves[source][indicator][uidx]
+        if show_spread and source in spread:
+            s = spread[source][indicator][uidx]
+            ax.fill_between(x, y - s, y + s, color=color, alpha=_PAPER_ALPHA_CI,
+                            linewidth=0, zorder=2)
+        ax.plot(x, y, color=color, lw=_PAPER_LW_BASELINE if dashed else _PAPER_LW_MEDIAN,
+                linestyle="--" if dashed else "-", zorder=4 if not dashed else 3)
+ 
+    def draw_cell(ax, indicator, uidx):
+        ax.axhline(0, color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG, linestyle=":", zorder=1)
+        _line(ax, "Simulations", uidx, indicator, _PAPER_C["sim"], dashed=False)
+        _line(ax, "Emulator", uidx, indicator, _PAPER_C["emulator"], dashed=False)
+        for b_idx, bname in enumerate(baselines):
+            if bname in curves:
+                _line(ax, bname, uidx, indicator, _baseline_color(b_idx), dashed=True)
+ 
+    legend_handles = [
+        mlines.Line2D([], [], color=_PAPER_C["diag"], lw=_PAPER_LW_DIAG,
+                      linestyle=":", label="Zero correlation"),
+        mlines.Line2D([], [], color=_PAPER_C["sim"], lw=_PAPER_LW_MEDIAN, label="Simulation"),
+        mlines.Line2D([], [], color=_PAPER_C["emulator"], lw=_PAPER_LW_MEDIAN, label="Emulator"),
+    ]
+    for b_idx, bname in enumerate(baselines):
+        legend_handles.append(mlines.Line2D([], [], color=_baseline_color(b_idx),
+                                            lw=_PAPER_LW_BASELINE, linestyle="--", label=bname))
+    if show_spread:
+        legend_handles.append(mpatches.Patch(color=_PAPER_C["sim"],
+                                             alpha=_PAPER_ALPHA_CI + 0.15,
+                                             label="\N{PLUS-MINUS SIGN}1 sd across pairs in bin"))
+ 
+    return _ranking_grid(
+        error_data, draw_cell=draw_cell, selection=selection,
+        share_y_per_row=share_y_per_row,
+        row_ylabel=lambda i: f"{error_data.short_label(i)} correlation",
+        xlabel=f"Great-circle distance ({x_unit})",
+        legend_handles=legend_handles,
+        panel_width=panel_width, panel_height=panel_height,
+        fontsize_title=fontsize_title, fontsize_ax=fontsize_ax,
+        fontsize_legend=fontsize_legend, hspace=0.42, wspace=0.32,
+        show_ranking_source=True, suptitle=suptitle, save_path=save_path, dpi=dpi,
+        per_cell_setup=lambda ax: ax.xaxis.set_major_locator(
+            plt.MaxNLocator(nbins=4, prune="both")
+        ),
+    )

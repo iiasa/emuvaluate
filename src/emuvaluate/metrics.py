@@ -59,6 +59,13 @@ __all__ = [
     # defaults
     "DEFAULT_INDICATORS", "DEFAULT_QQ_QUANTILES",
     "DEFAULT_TEMPORAL_CORR_N_LAGS", "DEFAULT_PSD_NPERSEG",
+    # correlation-vs-great-circle-distance curves
+    "great_circle_distance_km", "spatial_correlation_curves",
+    "correlation_length_km", "SPATIAL_CORR_METRIC_REGISTRY",
+    "build_spatial_correlation_curve_data_gridded",
+    "build_error_data_spatial_correlation_gridded",
+    "DEFAULT_SPATIAL_CORR_BINS", "DEFAULT_SPATIAL_CORR_MAX_KM",
+    "DEFAULT_CORR_LENGTH_THRESHOLD",
 ]
 
 
@@ -366,10 +373,24 @@ def temporal_corr_nmae(obs_curve: np.ndarray, pred_curve: np.ndarray) -> float:
     span = np.ptp(obs_curve)
     return float(np.mean(np.abs(obs_curve - pred_curve)) / span) if span > 0 else 0.0
 
-
+def temporal_corr_mae(obs_curve: np.ndarray, pred_curve: np.ndarray) -> float:
+    """MAE between two autocorrelation curves, in correlation units."""
+    return float(np.mean(np.abs(np.asarray(obs_curve) - np.asarray(pred_curve))))
+ 
+ 
+def temporal_corr_max_ae(obs_curve: np.ndarray, pred_curve: np.ndarray) -> float:
+    """Largest difference between two autocorrelation curves, at any lag."""
+    return float(np.max(np.abs(np.asarray(obs_curve) - np.asarray(pred_curve))))
+ 
 TEMPORAL_CORRELATION_METRIC_REGISTRY: dict[str, tuple[str, callable]] = {
     "temporal_corr_nmae": ("Temporal-Corr NMAE", temporal_corr_nmae),
 }
+TEMPORAL_CORRELATION_METRIC_REGISTRY["temporal_corr_mae"] = (
+    "Temporal-Corr MAE", temporal_corr_mae
+)
+TEMPORAL_CORRELATION_METRIC_REGISTRY["temporal_corr_max_ae"] = (
+    "Temporal-Corr Max AE", temporal_corr_max_ae
+)
 
 
 # ── Power spectral density (PSD) curves ──────────────────────────────────────
@@ -1275,3 +1296,529 @@ def build_error_data_intervariable_correlation_values(
         ranking_strategy=ranking_strategy, diff_baseline=diff_baseline,
         signed_values=True,
     )
+
+
+# ── Spatial correlation vs great-circle distance (gridded) ───────────────────
+#
+# The per-gridpoint quantity here is a *curve*: for gridpoint i, the mean
+# temporal correlation between i and every other gridpoint j, binned by the
+# great-circle distance between them. A well-behaved emulator should reproduce
+# how fast correlation decays with distance; one that generates each gridpoint
+# too independently will show a curve that drops off too fast.
+#
+# Two entry points, so the expensive part happens once:
+#   build_spatial_correlation_curve_data_gridded(...)  -> the curves
+#   build_error_data_spatial_correlation_gridded(...)  -> score between them
+# The second step is cheap, so you can score the same curves several ways
+# (see SPATIAL_CORR_METRIC_REGISTRY) without recomputing anything.
+# The curve data also feeds `plots.plot_spatial_correlation_curves_gridded`.
+ 
+EARTH_RADIUS_KM = 6371.0088
+DEFAULT_SPATIAL_CORR_BINS = 20
+# Half the Earth's circumference — the largest possible great-circle distance,
+# so the default binning never clips near-antipodal pairs.
+DEFAULT_SPATIAL_CORR_MAX_KM = float(np.pi * EARTH_RADIUS_KM)   # ~20015.1 km
+# e-folding level for the decorrelation-length metric.
+DEFAULT_CORR_LENGTH_THRESHOLD = float(1.0 / np.e)              # ~0.368
+ 
+ 
+def great_circle_distance_km(lat1, lon1, lat2, lon2) -> np.ndarray:
+    """
+    Haversine great-circle distance in km. All four arguments broadcast
+    against each other, so this computes a full pairwise block in one call:
+ 
+        d = great_circle_distance_km(lat_a[:, None], lon_a[:, None],
+                                     lat_b[None, :], lon_b[None, :])
+    """
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = p2 - p1
+    dlam = np.radians(np.asarray(lon2) - np.asarray(lon1))
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlam / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+ 
+ 
+def _flat_gridpoint_coords(lat: np.ndarray, lon: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    lat/lon for every flattened gridpoint, in the same C order that
+    `preprocessing.preprocess_gridded` uses when it flattens (lat, lon).
+    """
+    return np.repeat(np.asarray(lat), len(lon)), np.tile(np.asarray(lon), len(lat))
+ 
+ 
+def _standardised_samples(values: np.ndarray, max_samples: int | None,
+                          rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flatten (n_members, T, n_grid) to (n_samples, n_grid) and standardise each
+    gridpoint's column, so a correlation is just a scaled dot product.
+ 
+    Returns (Z, ok) where `ok` flags gridpoints with non-zero variance.
+    """
+    x = np.asarray(values, dtype=np.float64).reshape(-1, values.shape[-1])
+    if max_samples is not None and x.shape[0] > max_samples:
+        x = x[rng.choice(x.shape[0], size=max_samples, replace=False)]
+    mu = x.mean(axis=0)
+    sd = x.std(axis=0)
+    ok = sd > 0
+    return (x - mu) / np.where(ok, sd, 1.0), ok
+ 
+ 
+def spatial_correlation_curves(
+    values: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    *,
+    bin_edges: np.ndarray,
+    partner_idx: np.ndarray,
+    max_samples: int | None = None,
+    block_size: int = 256,
+    random_seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Correlation-vs-distance curve for every gridpoint.
+ 
+    For each gridpoint i, correlate its anomaly series with that of every
+    gridpoint in `partner_idx` (pooling members and timesteps), then average
+    those correlations within each great-circle distance bin.
+ 
+    Parameters
+    ----------
+    values      : (n_members, T, n_grid) — one indicator's preprocessed
+                  ensemble, usually with the ensemble mean removed so the
+                  correlations describe internal variability rather than the
+                  shared forced response.
+    lat, lon    : the grid axes, as carried by `preprocessing.GriddedArray`
+    bin_edges   : (n_bins + 1,) distance bin edges in km
+    partner_idx : which gridpoints to correlate against. Sampling partners
+                  rather than using all of them is what makes this tractable —
+                  a binned mean over a random subset is an unbiased estimate of
+                  the same bin mean. Pass the *same* array for every comparison
+                  so their curves are directly comparable.
+    max_samples : cap the pooled (member, time) samples used per correlation.
+                  None uses all of them.
+    block_size  : gridpoints scored per matrix multiply — trades memory for
+                  call overhead; the default is fine up to very large grids.
+    random_seed : seed for the `max_samples` subsample.
+ 
+    Returns
+    -------
+    (mean, std) : both (n_grid, n_bins). `mean` is the curve; `std` is the
+    spread of the individual pairwise correlations inside each bin, which the
+    plot shades. Bins with no pairs are NaN in both.
+    """
+    n_grid = values.shape[-1]
+    n_bins = len(bin_edges) - 1
+    rng = np.random.default_rng(random_seed)
+ 
+    z, ok = _standardised_samples(values, max_samples, rng)
+    n_samples = z.shape[0]
+ 
+    lat_flat, lon_flat = _flat_gridpoint_coords(lat, lon)
+    partner_idx = np.asarray(partner_idx)
+    z_partners = z[:, partner_idx]
+    lat_p, lon_p = lat_flat[partner_idx], lon_flat[partner_idx]
+    ok_p = ok[partner_idx]
+ 
+    curve_sum = np.zeros((n_grid, n_bins))
+    curve_sqsum = np.zeros((n_grid, n_bins))
+    curve_count = np.zeros((n_grid, n_bins))
+ 
+    for start in range(0, n_grid, block_size):
+        rows = np.arange(start, min(start + block_size, n_grid))
+        corr = (z[:, rows].T @ z_partners) / n_samples          # (n_rows, n_partners)
+ 
+        dist = great_circle_distance_km(
+            lat_flat[rows][:, None], lon_flat[rows][:, None], lat_p[None, :], lon_p[None, :]
+        )
+        bin_idx = np.digitize(dist, bin_edges) - 1
+ 
+        valid = (
+            (bin_idx >= 0) & (bin_idx < n_bins)
+            & np.isfinite(corr)
+            & ok[rows][:, None] & ok_p[None, :]
+            & (rows[:, None] != partner_idx[None, :])        # drop the self-pair
+        )
+ 
+        row_of = np.repeat(np.arange(len(rows)), len(partner_idx)).reshape(bin_idx.shape)
+        flat = (row_of[valid] * n_bins + bin_idx[valid])
+        vals = corr[valid]
+        size = len(rows) * n_bins
+        curve_count[rows] = np.bincount(flat, minlength=size).reshape(len(rows), n_bins)
+        curve_sum[rows] = np.bincount(flat, weights=vals, minlength=size).reshape(len(rows), n_bins)
+        curve_sqsum[rows] = np.bincount(flat, weights=vals * vals, minlength=size).reshape(len(rows), n_bins)
+ 
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(curve_count > 0, curve_sum / curve_count, np.nan)
+        var = np.where(curve_count > 0, curve_sqsum / curve_count - mean ** 2, np.nan)
+    return mean, np.sqrt(np.clip(var, 0, None))
+ 
+ 
+# ── Scoring the curves ───────────────────────────────────────────────────────
+#
+# A correlation-vs-distance curve is already unitless and bounded to [-1, 1],
+# which makes plain "mae" the sensible default here — unlike the timeseries
+# metrics, there is nothing to normalise away. Normalising by the simulated
+# curve's span (nmae) actively hurts: gridpoints whose correlation is flat and
+# near zero at every distance (the poles, typically) have a tiny span, so
+# dividing by it inflates their score and they dominate the "worst" ranking for
+# reasons that have nothing to do with the emulator. Use nmae only if you
+# specifically want each gridpoint scored relative to its own decay range.
+#
+# Every scorer takes (obs_curve, pred_curve, bin_centers, threshold) and
+# returns a float; unused arguments are ignored. Lower is better throughout,
+# and all of them are non-negative, so they work with the zero-anchored colour
+# scales in `plots.plot_map_gridded`.
+ 
+ 
+def _both_finite(obs_curve, pred_curve):
+    ok = np.isfinite(obs_curve) & np.isfinite(pred_curve)
+    return obs_curve[ok], pred_curve[ok]
+ 
+ 
+def spatial_corr_mae(obs_curve, pred_curve, bin_centers=None, threshold=None) -> float:
+    """Mean |difference| between the two curves, in correlation units."""
+    o, p = _both_finite(obs_curve, pred_curve)
+    return float(np.mean(np.abs(o - p))) if o.size else np.nan
+ 
+ 
+def spatial_corr_nmae(obs_curve, pred_curve, bin_centers=None, threshold=None) -> float:
+    """
+    `spatial_corr_mae` divided by the span of the observed curve — each
+    gridpoint scored against its own decay range. Beware near-flat curves:
+    a tiny span inflates the score (see the note above).
+    """
+    o, p = _both_finite(obs_curve, pred_curve)
+    if not o.size:
+        return np.nan
+    span = np.ptp(o)
+    mae = float(np.mean(np.abs(o - p)))
+    return mae / span if span > 0 else 0.0
+ 
+ 
+def spatial_corr_rmse(obs_curve, pred_curve, bin_centers=None, threshold=None) -> float:
+    """Root mean squared difference — weights a single badly-wrong bin more than mae."""
+    o, p = _both_finite(obs_curve, pred_curve)
+    return float(np.sqrt(np.mean((o - p) ** 2))) if o.size else np.nan
+ 
+ 
+def spatial_corr_max_ae(obs_curve, pred_curve, bin_centers=None, threshold=None) -> float:
+    """
+    Largest difference at any single distance — catches an emulator that tracks
+    the simulation everywhere except in one distance band.
+    """
+    o, p = _both_finite(obs_curve, pred_curve)
+    return float(np.max(np.abs(o - p))) if o.size else np.nan
+ 
+ 
+def spatial_corr_abs_bias(obs_curve, pred_curve, bin_centers=None, threshold=None) -> float:
+    """
+    |mean signed difference| — the systematic offset between the curves, as
+    opposed to `spatial_corr_mae`, which also counts scatter that averages out.
+    A gridpoint with a large mae but a small abs_bias wobbles around the right
+    curve; one where the two are equal is consistently off in one direction.
+ 
+    The sign itself is dropped so the score stays non-negative and usable with
+    the zero-anchored map colour scales. If you want the direction, take
+    `correlation_length_km` of both curves and compare, or read the curves off
+    `curve_data` directly.
+    """
+    o, p = _both_finite(obs_curve, pred_curve)
+    return float(np.abs(np.mean(p - o))) if o.size else np.nan
+ 
+ 
+def correlation_length_km(curve, bin_centers, threshold=DEFAULT_CORR_LENGTH_THRESHOLD) -> float:
+    """
+    Decorrelation length: the distance at which a correlation-vs-distance curve
+    first drops below *threshold*, linearly interpolated between the two
+    bracketing bin centres.
+ 
+    Parameters
+    ----------
+    curve       : (n_bins,) correlation per distance bin, NaNs allowed
+    bin_centers : (n_bins,) matching distances in km
+    threshold   : the crossing level. Default 1/e (~0.368), the e-folding
+                  distance — the usual convention for a decorrelation scale.
+ 
+    Returns
+    -------
+    float — km. 0.0 if the curve starts below the threshold, and the largest
+    bin centre if it never drops below (i.e. "at least this far"). NaN if the
+    curve has no finite values.
+    """
+    curve = np.asarray(curve, dtype=float)
+    x = np.asarray(bin_centers, dtype=float)
+    ok = np.isfinite(curve)
+    if not ok.any():
+        return np.nan
+    curve, x = curve[ok], x[ok]
+    below = np.flatnonzero(curve < threshold)
+    if below.size == 0:
+        return float(x[-1])
+    k = int(below[0])
+    if k == 0:
+        return 0.0
+    y0, y1 = curve[k - 1], curve[k]
+    if y0 == y1:
+        return float(x[k])
+    frac = (y0 - threshold) / (y0 - y1)
+    return float(x[k - 1] + frac * (x[k] - x[k - 1]))
+ 
+ 
+def spatial_corr_length_abs_diff(obs_curve, pred_curve, bin_centers,
+                                 threshold=DEFAULT_CORR_LENGTH_THRESHOLD) -> float:
+    """
+    |difference in decorrelation length|, in km — the most physically readable
+    of these scores: "this emulator's correlation length is 800 km too short".
+ 
+    Collapses each curve to a single number via `correlation_length_km` and
+    compares those, so it is insensitive to the curve's exact shape and
+    sensitive to the thing you usually care about — how far spatial coherence
+    reaches. Note the resolution is limited by the bin width, so use more
+    `n_bins` if you want a finer length estimate.
+    """
+    o_len = correlation_length_km(obs_curve, bin_centers, threshold)
+    p_len = correlation_length_km(pred_curve, bin_centers, threshold)
+    if not (np.isfinite(o_len) and np.isfinite(p_len)):
+        return np.nan
+    return float(abs(p_len - o_len))
+ 
+ 
+SPATIAL_CORR_METRIC_REGISTRY: dict[str, tuple[str, callable]] = {
+    "mae":         ("Spatial-Corr MAE",              spatial_corr_mae),
+    "nmae":        ("Spatial-Corr NMAE",             spatial_corr_nmae),
+    "rmse":        ("Spatial-Corr RMSE",             spatial_corr_rmse),
+    "max_ae":      ("Spatial-Corr Max AE",           spatial_corr_max_ae),
+    "abs_bias":    ("Spatial-Corr |bias|",           spatial_corr_abs_bias),
+    "length_diff": ("\N{GREEK CAPITAL LETTER DELTA} correlation length", spatial_corr_length_abs_diff),
+}
+ 
+ 
+def build_spatial_correlation_curve_data_gridded(
+    sim: dict,
+    emulator: dict,
+    baseline_emulations: dict | None = None,
+    *,
+    indicators: list[str] | None = None,
+    indicator_labels: dict[str, str] | None = None,
+    indicator_units: dict[str, str] | None = None,
+    n_bins: int = DEFAULT_SPATIAL_CORR_BINS,
+    max_distance_km: float = DEFAULT_SPATIAL_CORR_MAX_KM,
+    n_partners: int | None = 2000,
+    max_samples: int | None = None,
+    block_size: int = 256,
+    random_seed: int = 0,
+) -> dict:
+    """
+    Correlation-vs-distance curves for the simulation and every comparison —
+    the expensive half of the spatial-correlation diagnostic, computed once and
+    then fed to both `build_error_data_spatial_correlation_gridded` (for the
+    map) and `plots.plot_spatial_correlation_curves_gridded` (for the curves).
+ 
+    Parameters
+    ----------
+    sim, emulator : ``{indicator: preprocessing.GriddedArray}``, as returned by
+        `preprocessing.preprocess_gridded`. Preprocess with
+        ``remove_ensemble_mean=True`` — otherwise every gridpoint shares the
+        forced response and the correlations come out near 1 everywhere,
+        telling you nothing about the emulator's spatial structure.
+    baseline_emulations : ``{name: {indicator: GriddedArray}}`` — a
+        "Simulations vs Simulations" half-ensemble here gives you the
+        internal-variability floor to judge the emulator against.
+    indicators, indicator_labels, indicator_units : as in
+        `build_error_data_regional`.
+    n_bins, max_distance_km : the distance binning. The default is 20 bins out
+        to half the Earth's circumference (~20 015 km), i.e. ~1000 km per bin,
+        which spans every possible pair separation.
+    n_partners : how many gridpoints each one is correlated against. The cost
+        is ``n_grid × n_partners × n_samples``, so this is the knob that
+        decides the runtime; a binned mean over a random subset estimates the
+        same quantity as using every gridpoint. None uses all of them. The same
+        partner set is used for the simulation and every comparison, so their
+        curves are comparable.
+    max_samples : cap on the pooled (member, time) samples per correlation.
+        None uses all. Useful on long monthly runs.
+    block_size, random_seed : see `spatial_correlation_curves`.
+ 
+    Returns
+    -------
+    dict with keys:
+        "bin_edges", "bin_centers" : (n_bins + 1,) and (n_bins,) in km
+        "indicators", "indicator_labels", "indicator_units"
+        "lat", "lon"       : the shared grid
+        "partner_idx"      : the sampled partner gridpoints
+        "curves"           : curves[source][indicator] -> (n_grid, n_bins) mean
+        "spread"           : spread[source][indicator] -> (n_grid, n_bins) std
+        where *source* is "Simulations", "Emulator", and each baseline name.
+    """
+    comparison_arrays = {"Emulator": emulator, **(baseline_emulations or {})}
+    inds, labels, units = resolve_indicators(
+        sim, comparison_arrays, indicators, indicator_labels, indicator_units
+    )
+    ref = sim[inds[0]]
+    n_grid = ref.n_grid
+ 
+    bin_edges = np.linspace(0.0, float(max_distance_km), int(n_bins) + 1)
+    rng = np.random.default_rng(random_seed)
+    if n_partners is None or n_partners >= n_grid:
+        partner_idx = np.arange(n_grid)
+    else:
+        partner_idx = np.sort(rng.choice(n_grid, size=int(n_partners), replace=False))
+ 
+    def _curves_for(arrays: dict) -> tuple[dict, dict]:
+        mean, spread = {}, {}
+        for ind in inds:
+            m, s = spatial_correlation_curves(
+                arrays[ind].values, ref.lat, ref.lon,
+                bin_edges=bin_edges, partner_idx=partner_idx,
+                max_samples=max_samples, block_size=block_size, random_seed=random_seed,
+            )
+            mean[ind], spread[ind] = m, s
+        return mean, spread
+ 
+    curves, spread = {}, {}
+    curves["Simulations"], spread["Simulations"] = _curves_for(sim)
+    for name, arrays in comparison_arrays.items():
+        curves[name], spread[name] = _curves_for(arrays)
+ 
+    return {
+        "bin_edges": bin_edges,
+        "bin_centers": 0.5 * (bin_edges[:-1] + bin_edges[1:]),
+        "indicators": inds,
+        "indicator_labels": labels,
+        "indicator_units": units,
+        "lat": ref.lat,
+        "lon": ref.lon,
+        "partner_idx": partner_idx,
+        "curves": curves,
+        "spread": spread,
+    }
+ 
+ 
+def build_error_data_spatial_correlation_gridded(
+    curve_data: dict,
+    metric: str = "mae",
+    *,
+    length_threshold: float = DEFAULT_CORR_LENGTH_THRESHOLD,
+    ranking_strategy: str = "emulator",
+    diff_baseline: str | None = None,
+) -> ErrorData:
+    """
+    Score each comparison's correlation-vs-distance curve against the
+    simulation's, per gridpoint — an `ErrorData` that drops straight into
+    `plots.plot_map_gridded`, and that
+    `plots.plot_spatial_correlation_curves_gridded` uses for its ranking.
+ 
+    Cheap relative to building the curves, so scoring the same `curve_data`
+    with several metrics costs almost nothing:
+ 
+        cd = build_spatial_correlation_curve_data_gridded(sim, emu, baselines)
+        for m in ("mae", "length_diff"):
+            plot_map_gridded(build_error_data_spatial_correlation_gridded(cd, m))
+ 
+    Parameters
+    ----------
+    curve_data : from `build_spatial_correlation_curve_data_gridded`
+    metric : a key in `SPATIAL_CORR_METRIC_REGISTRY`:
+ 
+        "mae" (default)
+            Mean |difference| between the curves, in correlation units. The
+            right default: a correlation curve is already unitless and bounded,
+            so there is nothing to normalise, and every gridpoint is directly
+            comparable.
+        "nmae"
+            "mae" divided by the span of the simulated curve. Scores each
+            gridpoint against its own decay range, but inflates gridpoints
+            whose curve is flat and near zero at all distances — typically the
+            poles — so they crowd out the "worst" ranking for a reason that
+            has nothing to do with the emulator. Prefer "mae" unless you
+            specifically want the relative version.
+        "rmse"
+            Root mean squared difference; one badly-wrong distance band counts
+            for more than it does under "mae".
+        "max_ae"
+            The largest difference at any single distance.
+        "abs_bias"
+            |mean signed difference| — the systematic offset, ignoring scatter
+            that averages out. Compare against "mae" to tell a curve that is
+            consistently off from one that wobbles around the right answer.
+        "length_diff"
+            |difference in decorrelation length|, in km, via
+            `correlation_length_km`. The most physically readable option:
+            "the emulator's correlation length is 800 km too short". Since the
+            scores are kilometres, pass ``units={"tas": "km", "pr": "km"}`` to
+            `plots.plot_map_gridded` so the colourbar says so.
+ 
+    length_threshold : crossing level for "length_diff" — the correlation the
+        curve has to drop below to define the length scale. Default 1/e.
+    ranking_strategy : "emulator" (default) or a baseline name — whose error
+        orders the gridpoints for the best/median/worst curve plot.
+    diff_baseline : baseline to subtract from the Emulator scores for
+        `plot_map_gridded(..., show_difference=True)`. Defaults to the first
+        baseline, if any.
+ 
+    Returns
+    -------
+    ErrorData, with `lat`/`lon` set and metric ``"spatial_corr_<metric>"``
+    """
+    if metric not in SPATIAL_CORR_METRIC_REGISTRY:
+        raise ValueError(
+            f"Unknown spatial-correlation metric '{metric}'. "
+            f"Choose from {list(SPATIAL_CORR_METRIC_REGISTRY)}"
+        )
+    metric_label, score_fn = SPATIAL_CORR_METRIC_REGISTRY[metric]
+ 
+    inds = curve_data["indicators"]
+    curves = curve_data["curves"]
+    centers = np.asarray(curve_data["bin_centers"])
+    sim_curves = curves["Simulations"]
+    comparisons = [c for c in curves if c != "Simulations"]
+    baselines = [c for c in comparisons if c != "Emulator"]
+ 
+    n_grid = sim_curves[inds[0]].shape[0]
+    scores = {
+        name: {
+            ind: np.array([
+                score_fn(sim_curves[ind][j], curves[name][ind][j], centers, length_threshold)
+                for j in range(n_grid)
+            ])
+            for ind in inds
+        }
+        for name in comparisons
+    }
+    vmax = {ind: float(max(np.nanmax(scores[c][ind]) for c in comparisons)) for ind in inds}
+ 
+    valid = {"emulator"} | set(baselines)
+    if ranking_strategy not in valid:
+        raise ValueError(
+            f"ranking_strategy='{ranking_strategy}' is not valid. "
+            f"Choose 'emulator' or one of: {sorted(baselines)}"
+        )
+    rank_key = "Emulator" if ranking_strategy == "emulator" else ranking_strategy
+    ranking = {ind: _rank_units(scores[rank_key][ind], rank_key) for ind in inds}
+ 
+    diff = diff_vmax = resolved = None
+    if baselines:
+        resolved = diff_baseline or baselines[0]
+        if resolved not in baselines:
+            raise ValueError(f"diff_baseline '{resolved}' not found in {baselines}")
+        diff = {ind: scores["Emulator"][ind] - scores[resolved][ind] for ind in inds}
+        diff_vmax = {ind: float(np.nanmax(np.abs(diff[ind]))) for ind in inds}
+ 
+    return ErrorData(
+        metric=f"spatial_corr_{metric}",
+        metric_label=metric_label,
+        comparisons=comparisons,
+        indicators=list(inds),
+        scores=scores,
+        vmax=vmax,
+        ranking=ranking,
+        indicator_labels=dict(curve_data["indicator_labels"]),
+        indicator_units=dict(curve_data["indicator_units"]),
+        lat=curve_data["lat"],
+        lon=curve_data["lon"],
+        diff=diff,
+        diff_baseline=resolved,
+        diff_vmax=diff_vmax,
+    )
+ 
+ 
+
